@@ -1,14 +1,16 @@
-﻿# Extrator BPS-DA
+﻿<h1 align="center">Extrator BPS-DA</h1>
 
-Requisitos Obrigatórios
-1 - Consertar os csvs "corrompidos" 
-2 - Extração por PDM e Classe
-3 - Criação do Instalador
-4 - Checkbox se quer ou não salvar os corrompidos
+<h3>Requisitos Obrigatórios</h3>  
 
-Requisitos Desejáveis
-1 - Criar o texto padrão para ficar na interface do programa quando abrir
+- Consertar os csvs "corrompidos" 
+- Extração por PDM e Classe
+- Criação do Instalador
+- Checkbox se quer ou não salvar os corrompidos
 
-Requisitos Possíveis
-1 - Manter da tabela em "Verde Claro, Estilo de Tabela Média 28" no excel final
+<h3>Requisitos Desejáveis</h3>
+- Criar o texto padrão para ficar na interface do programa quando abrir
+
+<h3>Requisitos Possíveis</h3>
+- Manter da tabela em "Verde Claro, Estilo de Tabela Média 28" no excel final
+
 
