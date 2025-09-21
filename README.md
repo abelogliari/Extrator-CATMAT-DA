@@ -1,5 +1,3 @@
-<img width="403" height="25" alt="image" src="https://github.com/user-attachments/assets/75b297b8-4b3d-4aa0-9acc-1ed431530948" />﻿<h1 align="center">Extrator BPS-DA</h1>
-
 <h3>Requisitos Obrigatórios - <strong>PRIORIDADE</strong></h3>  
 
 - Consertar os csvs "corrompidos"; --- OK
@@ -15,6 +13,7 @@
 
 <h3>Requisitos Possíveis</h3>
 - Manter da tabela em "Verde Claro, Estilo de Tabela Média 28" no excel final;
+
 
 
 
