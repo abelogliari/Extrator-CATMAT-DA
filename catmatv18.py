@@ -272,6 +272,7 @@ def pagina_corrompida(csv_text: str, INDICE_COLUNA_T: int, INDICE_COLUNA_AI: int
         print(f"[pagina_corrompida] Erro ao reler CSV corrigido: {e}"); return True, None, csv_corrigido
 
 # ***** NOVA FUNÇÃO PARA LIMPEZA E TRANSFORMAÇÃO DOS DADOS *****
+# NOVA VERSÃO CORRIGIDA DA FUNÇÃO
 def processar_dataframe_final(df: pd.DataFrame, ordem_colunas: List[str]) -> pd.DataFrame:
     if df.empty:
         return df
@@ -282,24 +283,32 @@ def processar_dataframe_final(df: pd.DataFrame, ordem_colunas: List[str]) -> pd.
     if df.empty:
         return df
 
-    # 3. Criar a coluna "Unidade de Fornecimento"
+    # 3. Criar a coluna "Unidade de Fornecimento" com a nova regra
     def criar_unidade_fornecimento(row):
-        partes = [
-            row.get('nomeUnidadeFornecimento'),
-            row.get('capacidadeUnidadeFornecimento'),
-            row.get('siglaUnidadeMedida')
+        p1 = row.get('nomeUnidadeFornecimento')
+        p2 = row.get('capacidadeUnidadeFornecimento')
+        p3 = row.get('siglaUnidadeMedida')
+        
+        # Nova regra: só preenche se TODAS as 3 colunas tiverem conteúdo
+        partes_validas = [
+            str(p) for p in [p1, p2, p3] if pd.notna(p) and str(p).strip()
         ]
-        partes_validas = [str(p) for p in partes if pd.notna(p) and str(p).strip()]
-        return " ".join(partes_validas)
+        
+        if len(partes_validas) == 3:
+            return " ".join(partes_validas)
+        else:
+            return "" # Retorna vazio se alguma parte faltar
     
     df['Unidade de Fornecimento'] = df.apply(criar_unidade_fornecimento, axis=1)
 
-    # 4. Criar a coluna "Preço Total" com tratamento para formato brasileiro
+    # 4. Criar a coluna "Preço Total" com a lógica de conversão corrigida
     def converter_para_float(valor):
-        if not isinstance(valor, str):
-            valor = str(valor)
+        if pd.isna(valor): return 0.0
+        
+        valor_str = str(valor)
         try:
-            return float(valor.replace('.', '', valor.count('.') - 1).replace(',', '.'))
+            # Lógica corrigida: remove todos os pontos, depois troca a vírgula
+            return float(valor_str.replace('.', '').replace(',', '.'))
         except (ValueError, TypeError):
             return 0.0
 
@@ -310,7 +319,6 @@ def processar_dataframe_final(df: pd.DataFrame, ordem_colunas: List[str]) -> pd.
     # 6. Excluir colunas se estiverem totalmente vazias
     for col in ["nomeUnidadeMedida", "percentualMaiorDesconto"]:
         if col in df.columns:
-            # Verifica se todos os valores são nulos ou strings vazias/de espaços
             if df[col].isnull().all() or df[col].astype(str).str.strip().eq('').all():
                 df = df.drop(columns=[col])
 
@@ -320,7 +328,6 @@ def processar_dataframe_final(df: pd.DataFrame, ordem_colunas: List[str]) -> pd.
     df = df[colunas_existentes_na_ordem + colunas_extras]
 
     return df
-
 
 # --- ESTRUTURA DA INTERFACE GRÁFICA COM ABAS ---
 sg.theme('SystemDefaultForReal')
