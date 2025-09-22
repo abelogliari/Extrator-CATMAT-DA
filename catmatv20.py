@@ -97,13 +97,19 @@ def ler_pagina_catmat(codigo: int, pagina: int, URL_BASE, TAMANHO_PAGINA, TIMEOU
         try:
             resp = requests.get(URL, params=params, timeout=TIMEOUT, verify=False)
             if resp.status_code == 429:
-                wait = 30 if tentativas == 0 else 60; time.sleep(wait); tentativas += 1; continue
+                wait = 30 if tentativas == 0 else 60
+                time.sleep(wait)
+                tentativas += 1
+                continue
             resp.raise_for_status()
             csv_text = resp.content.decode("utf-8-sig", errors="replace")
             return None, csv_text
+        except requests.exceptions.ConnectionError as e:
+            return None, f"ERRO_CONEXAO: Falha de conexão ao buscar CATMAT {codigo}. Verifique sua rede. ({e})"
         except requests.exceptions.RequestException as e:
-            raise Exception(f"Erro de rede ao buscar CATMAT {codigo}: {e}")
-    raise Exception(f"Erro 429 persistente para CATMAT {codigo}")
+            return None, f"ERRO_REQUISICAO: Erro de rede ao buscar CATMAT {codigo}: {e}"
+            
+    return None, f"ERRO_REQUISICAO: Erro 429 (Too Many Requests) persistente para CATMAT {codigo}"
 
 
 def buscar_pdms_por_classe(codigo_classe: int, URL_BASE: str, TIMEOUT: int) -> Optional[Tuple[pd.DataFrame, int]]:
@@ -363,13 +369,13 @@ layout_explorador = [
         sg.Button("Exportar PDMs Visíveis", key="-EXPORTAR_PDMS-"), 
         sg.Checkbox('Selecionar Todos Visíveis', key='-SELECIONAR_TODOS_PDM-', enable_events=True)
         ], [
-        sg.Table(values=[], headings=pdm_headings, num_rows=15, key='-TABELA_PDMS-', enable_events=True, justification='left', auto_size_columns=False, col_widths=[10, 50, 8], expand_x=True, select_mode='extended') # << CORREÇÃO DO ERRO
+        sg.Table(values=[], headings=pdm_headings, num_rows=15, key='-TABELA_PDMS-', enable_events=True, justification='left', auto_size_columns=False, col_widths=[10, 50, 8], expand_x=True, select_mode='extended')
     ]], expand_x=True, expand_y=True)],
     
-    [sg.Frame('Busca Avulsa por PDMs', [[
+    [sg.Frame('Busca Avulsa por PDMs', [
         [sg.Text("Cole os códigos PDM (um por linha):"), sg.Push(), sg.Button('Buscar CATMATs (PDMs da Lista)', key='-BUSCAR_PDMS_ESPECIFICOS-')],
         [sg.Multiline(size=(40, 8), key='-INPUT_PDMS_ESPECIFICOS-')]
-    ]], expand_x=True)],
+    ], expand_x=True)],
     
     [sg.Frame('3. Ações', [[
         sg.Button('Buscar CATMATs (PDMs da Tabela)', key='-BUSCAR_CATMATS-'),
@@ -726,8 +732,12 @@ while True:
             
             try:
                 _, csv_text = ler_pagina_catmat(codigo, pagina_atual, URL_BASE, 500, TIMEOUT)
-                if csv_text is None:
-                    window["-OUTPUT-"].print(f"ℹ️ Código {codigo}: Nenhum registro encontrado.", text_color='lightblue'); codigos_vazios_count += 1; window["-CONT_VAZIOS-"].update(codigos_vazios_count)
+                if csv_text and csv_text.startswith("ERRO_CONEXAO"):
+                    sg.popup_error(csv_text)
+                    processing = False 
+                    raise StopIteration
+                if csv_text is None or csv_text.startswith("ERRO_REQUISICAO"):
+                    window["-OUTPUT-"].print(f"ℹ️ Código {codigo}: Falha ou nenhum registro. {csv_text or ''}", text_color='lightblue'); codigos_vazios_count += 1; window["-CONT_VAZIOS-"].update(codigos_vazios_count)
                     raise StopIteration 
                 
                 m_reg = re.search(r"totalRegistros\s*:\s*(\d+)", csv_text, re.IGNORECASE)
@@ -770,7 +780,7 @@ while True:
                     time.sleep(0.5)
                     if pagina_atual > total_paginas: break
                     _, csv_text = ler_pagina_catmat(codigo, pagina_atual, URL_BASE, 500, TIMEOUT)
-                    if csv_text is None: break
+                    if csv_text is None or csv_text.startswith("ERRO_"): break
 
             except StopIteration: pass
             except Exception as e: window["-OUTPUT-"].print(f"❌ Erro crítico no código {codigo}: {e}", text_color='#FF6347')
