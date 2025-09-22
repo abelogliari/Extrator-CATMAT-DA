@@ -163,7 +163,7 @@ def buscar_catmats_por_pdm(codigos_pdm: List[int], URL_BASE: str, TIMEOUT: int, 
                 while pagina_atual <= total_paginas:
                     if cancelar_busca_catmat: raise InterruptedError
                     
-                    params = {"codigoPdm": pdm_code, "pagina": pagina_atual, "tamanhoPagina": 500, "bps": "false"}
+                    params = {"pagina": pagina_atual, "tamanhoPagina": 500, "codigoPdm": pdm_code, "bps": "false"}
                     resp = requests.get(URL, params=params, timeout=TIMEOUT, verify=False)
                     
                     if resp.status_code == 429:
@@ -190,7 +190,7 @@ def buscar_catmats_por_pdm(codigos_pdm: List[int], URL_BASE: str, TIMEOUT: int, 
                         sg.popup_error(f"Erro 429 persistente para o PDM {pdm_code}. Pulando este PDM.")
                         break 
                     
-                    wait = 30 if tentativas == 1 else 60
+                    wait = 61 if tentativas == 1 else 90
                     window['-STATUS_EXPLORADOR-'].update(f"Limite da API (429) no PDM {pdm_code}. Aguardando {wait}s...")
                     window.refresh()
                     time.sleep(wait)
@@ -397,7 +397,7 @@ window['-INPUT_CLASSE-'].bind('<Return>', '_Enter')
 
 # --- LOOP DE EVENTOS E LÓGICA DE CONTROLE ---
 URL_BASE = "https://dadosabertos.compras.gov.br"
-TIMEOUT = 60
+TIMEOUT = 120
 ordem_final_colunas = [
     "idCompra", "idItemCompra", "forma", "modalidade", "criterioJulgamento",
     "numeroItemCompra", "descricaoItem", "codigoItemCatalogo", "nomeUnidadeFornecimento",
@@ -456,7 +456,7 @@ def iniciar_processo_extracao(lista_codigos):
     window["-STATUS-"].update("Status: Processando...")
 
 while True:
-    event, values = window.read(timeout=100)
+    event, values = window.read(timeout=120)
 
     if event == sg.WIN_CLOSED: break
 
