@@ -83,11 +83,11 @@ def parse_csv_text(csv_text: str) -> pd.DataFrame:
     lines = [ln for ln in csv_text.splitlines() if ln.strip()]
     if not lines: return pd.DataFrame()
     try:
-        return pd.read_csv(StringIO("\n".join(lines)), sep=";", dtype=str, engine="python", on_bad_lines='warn', quoting=0)
+        # Usando quoting=3 (csv.QUOTE_NONE) para que o pandas não tente interpretar as aspas como especiais
+        return pd.read_csv(StringIO("\n".join(lines)), sep=";", dtype=str, engine="python", on_bad_lines='warn', quoting=3)
     except Exception as e:
         sg.popup_error(f"⚠ Erro ao ler CSV: {e}")
         return pd.DataFrame()
-
 
 def ler_pagina_catmat(codigo: int, pagina: int, URL_BASE, TAMANHO_PAGINA, TIMEOUT) -> Tuple[Optional[pd.DataFrame], Optional[str]]:
     URL = f"{URL_BASE}/modulo-pesquisa-preco/1.1_consultarMaterial_CSV"
@@ -221,37 +221,63 @@ def pagina_corrompida(csv_text: str) -> Tuple[bool, str]:
     if not linhas_originais:
         return False, csv_text
     
+    num_colunas_esperado = 0
+    header_index = -1
+    header_line = ""
+
+    # 1. Encontra a linha de cabeçalho e define o número esperado de colunas a partir dela.
     try:
-        primeira_linha_de_dados = next(ln for ln in linhas_originais if not ln.lower().startswith(("totalregistros:", "totalpaginas:")))
-        num_colunas_esperado = len(primeira_linha_de_dados.split(';'))
+        header_index = next(i for i, ln in enumerate(linhas_originais) if not ln.lower().startswith(("totalregistros:", "totalpaginas:")))
+        header_line = linhas_originais[header_index]
+        num_colunas_esperado = len(header_line.split(';'))
     except StopIteration:
+        # Se não houver cabeçalho (arquivo só com metadados), retorna como está.
         return False, csv_text
 
+    # Se por algum motivo o cabeçalho estiver vazio ou malformado, não faz nada.
+    if num_colunas_esperado == 0:
+        return False, csv_text
+
+    # 2. Processa todas as linhas com base no número de colunas do cabeçalho.
     linhas_corrigidas = []
     buffer_linha = ""
     foi_corrigido = False
-    for linha in linhas_originais:
+
+    # Adiciona as linhas de metadados que possam existir ANTES do cabeçalho
+    linhas_corrigidas.extend(linhas_originais[:header_index])
+    # Adiciona o próprio cabeçalho
+    linhas_corrigidas.append(header_line)
+
+    # Itera apenas sobre as linhas de DADOS (tudo que vem depois do cabeçalho)
+    for linha in linhas_originais[header_index + 1:]:
+        # Se for uma linha de metadados no final do arquivo, descarrega o buffer e adiciona a linha.
         if linha.lower().startswith(("totalregistros:", "totalpaginas:")):
+            if buffer_linha:
+                linhas_corrigidas.append(buffer_linha)
+                buffer_linha = ""
             linhas_corrigidas.append(linha)
             continue
         
-        linha_atual = buffer_linha + linha.strip()
+        # Lógica principal de concatenação: remove quebras de linha e junta o texto
+        linha_atual = buffer_linha + linha.replace("\r", "").replace("\n", "")
         num_colunas_atual = len(linha_atual.split(';'))
 
+        # Se a linha concatenada ainda for menor que o esperado, continua no buffer.
         if num_colunas_atual < num_colunas_esperado:
-            buffer_linha = linha_atual + " "
+            buffer_linha = linha_atual + " "  # Adiciona espaço para evitar juntar palavras
             foi_corrigido = True
+        # Se atingiu o tamanho esperado, é uma linha completa.
         else:
             linhas_corrigidas.append(linha_atual)
             buffer_linha = ""
     
+    # 3. Se sobrou algo no buffer ao final, é o último registro.
     if buffer_linha:
         linhas_corrigidas.append(buffer_linha)
     
     csv_corrigido_final = "\n".join(linhas_corrigidas)
     
     return foi_corrigido, csv_corrigido_final
-
 
 def processar_dataframe_final(df: pd.DataFrame, ordem_colunas: List[str]) -> pd.DataFrame:
     if df.empty:
