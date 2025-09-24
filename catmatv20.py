@@ -11,11 +11,9 @@ import shutil
 import json
 import threading
 
-# --- Variáveis de Controle ---
 pausar_extracao = threading.Event()
 pausar_busca_catmat = threading.Event()
 
-# --- Funções e Classes de Lógica de Negócio ---
 
 requests.packages.urllib3.disable_warnings(requests.packages.urllib3.exceptions.InsecureRequestWarning)
 
@@ -83,7 +81,6 @@ def parse_csv_text(csv_text: str) -> pd.DataFrame:
     lines = [ln for ln in csv_text.splitlines() if ln.strip()]
     if not lines: return pd.DataFrame()
     try:
-        # Usando quoting=3 (csv.QUOTE_NONE) para que o pandas não tente interpretar as aspas como especiais
         return pd.read_csv(StringIO("\n".join(lines)), sep=";", dtype=str, engine="python", on_bad_lines='warn', quoting=3)
     except Exception as e:
         sg.popup_error(f"⚠ Erro ao ler CSV: {e}")
@@ -225,32 +222,24 @@ def pagina_corrompida(csv_text: str) -> Tuple[bool, str]:
     header_index = -1
     header_line = ""
 
-    # 1. Encontra a linha de cabeçalho e define o número esperado de colunas a partir dela.
     try:
         header_index = next(i for i, ln in enumerate(linhas_originais) if not ln.lower().startswith(("totalregistros:", "totalpaginas:")))
         header_line = linhas_originais[header_index]
         num_colunas_esperado = len(header_line.split(';'))
     except StopIteration:
-        # Se não houver cabeçalho (arquivo só com metadados), retorna como está.
         return False, csv_text
 
-    # Se por algum motivo o cabeçalho estiver vazio ou malformado, não faz nada.
     if num_colunas_esperado == 0:
         return False, csv_text
 
-    # 2. Processa todas as linhas com base no número de colunas do cabeçalho.
     linhas_corrigidas = []
     buffer_linha = ""
     foi_corrigido = False
 
-    # Adiciona as linhas de metadados que possam existir ANTES do cabeçalho
     linhas_corrigidas.extend(linhas_originais[:header_index])
-    # Adiciona o próprio cabeçalho
     linhas_corrigidas.append(header_line)
 
-    # Itera apenas sobre as linhas de DADOS (tudo que vem depois do cabeçalho)
     for linha in linhas_originais[header_index + 1:]:
-        # Se for uma linha de metadados no final do arquivo, descarrega o buffer e adiciona a linha.
         if linha.lower().startswith(("totalregistros:", "totalpaginas:")):
             if buffer_linha:
                 linhas_corrigidas.append(buffer_linha)
@@ -258,20 +247,16 @@ def pagina_corrompida(csv_text: str) -> Tuple[bool, str]:
             linhas_corrigidas.append(linha)
             continue
         
-        # Lógica principal de concatenação: remove quebras de linha e junta o texto
         linha_atual = buffer_linha + linha.replace("\r", "").replace("\n", "")
         num_colunas_atual = len(linha_atual.split(';'))
 
-        # Se a linha concatenada ainda for menor que o esperado, continua no buffer.
         if num_colunas_atual < num_colunas_esperado:
-            buffer_linha = linha_atual + " "  # Adiciona espaço para evitar juntar palavras
+            buffer_linha = linha_atual + " " 
             foi_corrigido = True
-        # Se atingiu o tamanho esperado, é uma linha completa.
         else:
             linhas_corrigidas.append(linha_atual)
             buffer_linha = ""
     
-    # 3. Se sobrou algo no buffer ao final, é o último registro.
     if buffer_linha:
         linhas_corrigidas.append(buffer_linha)
     
@@ -284,7 +269,7 @@ def processar_dataframe_final(df: pd.DataFrame, ordem_colunas: List[str]) -> pd.
         return df
 
     primeira_coluna = df.columns[0]
-    df = df[~df[primeira_coluna].astype(str).str.contains("totalRegistros|totalPaginas", case=False, na=False)]
+    df = df[~df[primeira_coluna].astype(str).str.contains("totalRegistros|totalPaginas", case=False, na=False)].copy()
     if df.empty:
         return df
 
@@ -326,8 +311,6 @@ def processar_dataframe_final(df: pd.DataFrame, ordem_colunas: List[str]) -> pd.
 
     return df
 
-
-# --- ESTRUTURA DA INTERFACE GRÁFICA COM ABAS ---
 sg.theme('SystemDefaultForReal')
 
 welcome_message = """Olá! Bem-vindo ao Extrator de CATMATs Pro.
@@ -429,7 +412,6 @@ window.set_min_size((800, 700))
 
 window['-INPUT_CLASSE-'].bind('<Return>', '_Enter')
 
-# --- LOOP DE EVENTOS E LÓGICA DE CONTROLE ---
 URL_BASE = "https://dadosabertos.compras.gov.br"
 TIMEOUT = 120
 ordem_final_colunas = [
@@ -519,7 +501,6 @@ while True:
 
     if event == sg.WIN_CLOSED: break
 
-    # --- LÓGICA GERAL E DA ABA DE EXTRAÇÃO ---
     if not processing:
         arquivo_ok = bool(values['-ARQUIVO-'])
         pasta_ok = not values['-SALVAR_CORROMPIDOS-'] or (values['-SALVAR_CORROMPIDOS-'] and values['-PASTA-'])
@@ -579,7 +560,6 @@ while True:
                 sg.popup_quick("Log salvo com sucesso!")
             except Exception as e: sg.popup_error(f"Não foi possível salvar o log.\nErro: {e}")
 
-    # --- LÓGICA DO EXPLORADOR DE CLASSES ---
     if event in ('-BUSCAR_PDMS-', '-INPUT_CLASSE-_Enter'):
         codigo_classe = values['-INPUT_CLASSE-']
         if codigo_classe and codigo_classe.isdigit():
@@ -652,7 +632,7 @@ while True:
             else:
                 dados_tabela = window['-TABELA_PDMS-'].Values
                 pdms_selecionados = [int(dados_tabela[i][0]) for i in indices_selecionados if i < len(dados_tabela)]
-        else: # '-BUSCAR_PDMS_ESPECIFICOS-'
+        else:
             pdms_texto = values['-INPUT_PDMS_ESPECIFICOS-']
             if not pdms_texto.strip():
                 sg.popup_error("Por favor, insira pelo menos um código PDM na caixa de busca avulsa.")
@@ -745,7 +725,6 @@ while True:
                 except Exception as e:
                     sg.popup_error(f"Não foi possível salvar a lista.\nErro: {e}")
 
-    # --- LÓGICA PRINCIPAL DE PROCESSAMENTO (QUANDO ATIVA) ---
     if processing:
         pausar_extracao.wait() 
         try:
