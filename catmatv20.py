@@ -325,7 +325,7 @@ Este programa possui duas funções principais em abas separadas:
 2.  Explorador de Classes (Aba 2): Se você quer descobrir novos itens, pode começar com o código de uma Classe, encontrar todos os Padrões Descritivos de Materiais (PDMs) dentro dela e, em seguida, listar todos os CATMATs relacionados para extração.
 
 Primeiros Passos:
-- Para uma extração direta com uma lista pronta, use a primeira aba.
+- Para uma extração direta com uma lista pronta, use a primeira aba, o arquivo excel deve iniciar a lista dos CATMATs com o cabeçalho codigoItemCatalogo.
 - Para descobrir itens, comece pela segunda aba e, ao final, envie os CATMATs encontrados para a extração na primeira aba.
 
 Acompanhe todo o processo em tempo real aqui neste log. Bom trabalho!
