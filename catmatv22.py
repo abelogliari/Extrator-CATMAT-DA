@@ -10,12 +10,15 @@ from openpyxl import Workbook
 import shutil
 import json
 import threading
+import math
 
 pausar_extracao = threading.Event()
 pausar_busca_catmat = threading.Event()
 
 
 requests.packages.urllib3.disable_warnings(requests.packages.urllib3.exceptions.InsecureRequestWarning)
+
+# --- SUBSTITUA A CLASSE ExcelChunkWriter ANTIGA POR ESTAS DUAS ---
 
 class ExcelChunkWriter:
     def __init__(self, base_filename: str, sheet_name: str = "Dados CATMAT", max_rows_per_file: int = 1_000_000):
@@ -30,7 +33,9 @@ class ExcelChunkWriter:
 
     def _filepath(self) -> str:
         base, ext = os.path.splitext(self.base_filename)
-        return f"{base}_part{self.part}{ext or '.xlsx'}"
+        # Garante a extensão .xlsx
+        if not ext or ext.lower() != '.xlsx': ext = '.xlsx'
+        return f"{base}_part{self.part}{ext}"
 
     def _new_workbook(self):
         self.wb = Workbook()
@@ -52,21 +57,22 @@ class ExcelChunkWriter:
             self.files_saved.append(path)
             self.part += 1
             self._new_workbook()
-            if self.header: self.ws.append(self.header)
+            if self.header: 
+                self.ws.append(self.header)
+                self.header_written = True
 
     def write_dataframe(self, df: pd.DataFrame):
         if df is None or df.empty: return
         self._ensure_header(list(df.columns))
+        
+        # Alinha colunas
         for col in self.header:
-            if col not in df.columns:
-                df[col] = pd.NA
+            if col not in df.columns: df[col] = pd.NA
         df = df[self.header]
         
         for _, row in df.iterrows():
             self._rollover_if_needed(1)
-            self.ws.append([
-                None if pd.isna(value) else value for value in row
-            ])
+            self.ws.append([None if pd.isna(value) else value for value in row])
             self.current_row_count += 1
 
     def finalize(self) -> List[str]:
@@ -76,6 +82,48 @@ class ExcelChunkWriter:
             if path not in self.files_saved: self.files_saved.append(path)
         return self.files_saved
 
+class CSVChunkWriter:
+    def __init__(self, base_filename: str, sep: str = ';', encoding: str = 'utf-8-sig', max_rows_per_file: int = 1_000_000):
+        self.base_filename = base_filename
+        self.sep = sep
+        self.encoding = encoding
+        self.max_rows = max_rows_per_file
+        self.part = 1
+        self.current_row_count = 0
+        self.files_saved = []
+        self.header_written_current_file = False
+
+    def _filepath(self) -> str:
+        base, ext = os.path.splitext(self.base_filename)
+        # Garante a extensão .csv
+        if not ext or ext.lower() != '.csv': ext = '.csv'
+        return f"{base}_part{self.part}{ext}"
+
+    def write_dataframe(self, df: pd.DataFrame):
+        if df is None or df.empty: return
+        
+        rows_in_df = len(df)
+        
+        # Se adicionar esse DF estourar o limite, salvamos e vamos pro próximo (lógica simplificada para CSV em bloco)
+        if self.current_row_count + rows_in_df > self.max_rows:
+            self.part += 1
+            self.current_row_count = 0
+            self.header_written_current_file = False
+        
+        path = self._filepath()
+        mode = 'a' if self.header_written_current_file else 'w'
+        header = not self.header_written_current_file
+        
+        df.to_csv(path, sep=self.sep, index=False, mode=mode, header=header, encoding=self.encoding)
+        
+        self.header_written_current_file = True
+        self.current_row_count += rows_in_df
+        
+        if path not in self.files_saved:
+            self.files_saved.append(path)
+
+    def finalize(self) -> List[str]:
+        return self.files_saved
 
 def parse_csv_text(csv_text: str) -> pd.DataFrame:
     lines = [ln for ln in csv_text.splitlines() if ln.strip()]
@@ -113,11 +161,18 @@ def buscar_pdms_por_classe(codigo_classe: int, URL_BASE: str, TIMEOUT: int) -> O
     URL = f"{URL_BASE}/modulo-material/3_consultarPdmMaterial"
     all_pdms = []
     pagina_atual = 1
-    total_paginas = 1
+    total_paginas = 1  # Valor inicial provisório
     total_registros_api = 0
+    TAMANHO_PAGINA = 500 # Definimos uma constante para garantir consistência
 
     while pagina_atual <= total_paginas:
-        params = {"codigoClasse": codigo_classe, "pagina": pagina_atual, "bps": "false"}
+        params = {
+            "codigoClasse": codigo_classe, 
+            "pagina": pagina_atual, 
+            "tamanhoPagina": TAMANHO_PAGINA, 
+            "bps": "false"
+        }
+        
         try:
             resp = requests.get(URL, params=params, timeout=TIMEOUT, verify=False)
             resp.raise_for_status()
@@ -126,9 +181,19 @@ def buscar_pdms_por_classe(codigo_classe: int, URL_BASE: str, TIMEOUT: int) -> O
             if "resultado" in data:
                 all_pdms.extend(data["resultado"])
 
+            # Lógica de cálculo manual de páginas
             if pagina_atual == 1:
-                total_paginas = data.get("totalPaginas", 1)
-                total_registros_api = data.get("totalRegistros", 0)
+                total_registros_api = int(data.get("totalRegistros", 0))
+                
+                # SE a API diz que tem mais de 500 registros, calculamos as páginas na mão
+                if total_registros_api > 0:
+                    # Ex: 1875 / 500 = 3.75 -> Teto = 4 páginas
+                    total_paginas = math.ceil(total_registros_api / TAMANHO_PAGINA)
+                else:
+                    total_paginas = 1
+                
+                # Log de depuração (opcional, aparece no print do console)
+                print(f"DEBUG: Registros: {total_registros_api} | Páginas Calculadas: {total_paginas}")
 
             pagina_atual += 1
             time.sleep(0.5)
@@ -144,8 +209,11 @@ def buscar_pdms_por_classe(codigo_classe: int, URL_BASE: str, TIMEOUT: int) -> O
         return None
 
     df = pd.DataFrame(all_pdms)
+    
+    # Validação final para garantir que não duplicamos dados se a API se comportar de forma estranha
+    df = df.drop_duplicates(subset=['codigoPdm'])
+    
     return df, total_registros_api
-
 
 def buscar_catmats_por_pdm(codigos_pdm: List[int], URL_BASE: str, TIMEOUT: int, window: sg.Window) -> Tuple[Optional[pd.DataFrame], List[int]]:
     global cancelar_busca_catmat
@@ -157,14 +225,16 @@ def buscar_catmats_por_pdm(codigos_pdm: List[int], URL_BASE: str, TIMEOUT: int, 
     for i, pdm_code in enumerate(codigos_pdm):
         pausar_busca_catmat.wait() 
         if cancelar_busca_catmat:
-            window['-STATUS_EXPLORADOR-'].update("Busca cancelada pelo usuário.")
+            # CORREÇÃO: Usar write_event_value em vez de update direto
+            window.write_event_value('-UPDATE_STATUS_EXPLORADOR-', "Busca cancelada pelo usuário.")
             break
 
         pagina_atual = 1
         total_paginas = 1
         
-        window['-STATUS_EXPLORADOR-'].update(f"Buscando CATMATs do PDM {pdm_code} ({i+1}/{total_pdms})...")
-        window.refresh()
+        # CORREÇÃO: Enviar o texto para o loop principal atualizar
+        window.write_event_value('-UPDATE_STATUS_EXPLORADOR-', f"Buscando CATMATs do PDM {pdm_code} ({i+1}/{total_pdms})...")
+        # REMOVIDO: window.refresh() (Isso quebra threads, não use refresh em threads)
 
         while True: 
             try:
@@ -192,13 +262,15 @@ def buscar_catmats_por_pdm(codigos_pdm: List[int], URL_BASE: str, TIMEOUT: int, 
                 break 
 
             except requests.exceptions.RequestException as e:
-                window['-STATUS_EXPLORADOR-'].update(f"⚠️ Erro no PDM {pdm_code}. Adicionado à fila de nova tentativa.")
+                # CORREÇÃO: write_event_value
+                window.write_event_value('-UPDATE_STATUS_EXPLORADOR-', f"⚠️ Erro no PDM {pdm_code}. Adicionado à fila de nova tentativa.")
                 pdms_com_erro.append(pdm_code)
                 time.sleep(1)
                 break 
 
             except json.JSONDecodeError:
-                window['-STATUS_EXPLORADOR-'].update(f"⚠️ Erro de JSON no PDM {pdm_code}. Adicionado à fila de nova tentativa.")
+                # CORREÇÃO: write_event_value
+                window.write_event_value('-UPDATE_STATUS_EXPLORADOR-', f"⚠️ Erro de JSON no PDM {pdm_code}. Adicionado à fila de nova tentativa.")
                 pdms_com_erro.append(pdm_code)
                 time.sleep(1)
                 break
@@ -333,6 +405,13 @@ Acompanhe todo o processo em tempo real aqui neste log. Bom trabalho!
 
 layout_extracao_config = [
     [sg.Text("Arquivo de Códigos:", size=(20,1)), sg.Input(key="-ARQUIVO-", enable_events=True, expand_x=True), sg.FileBrowse(button_text='Procurar', file_types=(("Excel Files", "*.xlsx"), ("CSV Files", "*.csv")))],
+    
+    # --- NOVO: SELEÇÃO DE FORMATO ---
+    [sg.Text("Formato de Saída:", size=(20,1)), 
+     sg.Radio('Excel (.xlsx)', "GROUP_FMT", default=True, key='-FMT_XLSX-'), 
+     sg.Radio('CSV (.csv)', "GROUP_FMT", key='-FMT_CSV-')],
+    # --------------------------------
+    
     [sg.Checkbox('Salvar cópias dos arquivos CSV corrompidos?', key='-SALVAR_CORROMPIDOS-', default=False, enable_events=True)],
     [sg.Column([[sg.Text("Pasta para Corrompidos:", size=(20,1)), sg.Input(key="-PASTA-", enable_events=True, expand_x=True), sg.FolderBrowse(button_text='Procurar')]], key='-SECAO_PASTA_CORROMPIDOS-', visible=False)],
 ]
@@ -468,7 +547,7 @@ def atualizar_cores_filtro(botao_ativo: str, window: sg.Window):
         else:
             window[botao].update(button_color=COR_BOTAO_PADRAO)
 
-def iniciar_processo_extracao(lista_codigos):
+def iniciar_processo_extracao(lista_codigos, formato_saida='xlsx'):
     global processing, codes_iterator, writer, paginas_corrompidas, registros_esperados, registros_baixados, codigos_para_processar
     global total_registros_baixados, paginas_corrigidas_count, codigos_vazios_count
     
@@ -486,7 +565,15 @@ def iniciar_processo_extracao(lista_codigos):
     window["-CONT_PROCESSADOS-"].update(f"0 / {len(codigos_para_processar)}"); window["-CONT_REGISTROS-"].update("0")
     window["-CONT_CORRIGIDAS-"].update("0"); window["-CONT_VAZIOS-"].update("0")
 
-    writer = ExcelChunkWriter("dados_completos_extraidos.xlsx")
+    # --- LÓGICA DE ESCOLHA DO ESCRITOR ---
+    if formato_saida == 'csv':
+        writer = CSVChunkWriter("dados_completos_extraidos.csv")
+        window["-OUTPUT-"].print(f"💾 Configurado para salvar em CSV.", text_color='lightgreen')
+    else:
+        writer = ExcelChunkWriter("dados_completos_extraidos.xlsx")
+        window["-OUTPUT-"].print(f"💾 Configurado para salvar em Excel.", text_color='lightgreen')
+    # -------------------------------------
+
     paginas_corrompidas, registros_esperados, registros_baixados = {}, {}, {}
     total_registros_baixados, paginas_corrigidas_count, codigos_vazios_count = 0, 0, 0
     
@@ -519,7 +606,12 @@ while True:
                 continue
             lista_codigos = pd.Series(df_codigos["codigoItemCatalogo"]).dropna().astype(int).drop_duplicates().tolist()
             window["-OUTPUT-"].print(f"🔎 {len(lista_codigos)} códigos únicos carregados do arquivo.", text_color='lightblue')
-            iniciar_processo_extracao(lista_codigos)
+            
+            # --- CAPTURA O FORMATO ESCOLHIDO ---
+            formato = 'csv' if values['-FMT_CSV-'] else 'xlsx'
+            iniciar_processo_extracao(lista_codigos, formato_saida=formato)
+            # -----------------------------------
+            
         except Exception as e:
             sg.popup_error(f"Ocorreu um erro ao ler o arquivo de códigos:\n{e}")
 
@@ -529,7 +621,11 @@ while True:
         else:
             window['-TAB_EXTRACAO-'].select()
             window["-OUTPUT-"].print(f"🔎 {len(lista_catmats_descobertos)} códigos descobertos via explorador.", text_color='lightblue')
-            iniciar_processo_extracao(lista_catmats_descobertos)
+            
+            # --- CAPTURA O FORMATO DA ABA 1 ---
+            formato = 'csv' if values['-FMT_CSV-'] else 'xlsx'
+            iniciar_processo_extracao(lista_catmats_descobertos, formato_saida=formato)
+            # ----------------------------------
 
     if event == "-CANCEL-" and processing:
         processing = False; codes_iterator = None
@@ -851,11 +947,22 @@ while True:
                 sg.popup('Resumo da Extração', resumo_final)
                 
                 ultimo_arquivo = saved_parts[-1]
-                caminho_destino = sg.popup_get_file("Escolha onde salvar o arquivo de DADOS principal", save_as=True, no_window=True, default_path=os.path.basename(ultimo_arquivo), file_types=(("Arquivos Excel", "*.xlsx"),))
-                if caminho_destino:
-                    if not caminho_destino.lower().endswith(".xlsx"): caminho_destino += ".xlsx"
-                    shutil.copy(ultimo_arquivo, caminho_destino); sg.popup("✅ Sucesso!", f"Arquivo de DADOS salvo em:\n{caminho_destino}\n\nO relatório foi salvo na pasta do programa.")
-                else: sg.popup("⚠ Atenção", f"Nenhum local escolhido. O arquivo de DADOS permanece em:\n{ultimo_arquivo}")
+                extensao_final = os.path.splitext(ultimo_arquivo)[1] # Pega .csv ou .xlsx automaticamente
+                tipos_arquivo = (("Excel Files", "*.xlsx"),) if extensao_final == '.xlsx' else (("CSV Files", "*.csv"),)
+                caminho_destino = sg.popup_get_file(
+                    "Escolha onde salvar o arquivo de DADOS principal", 
+                    save_as=True, 
+                    no_window=True, 
+                    default_path=os.path.basename(ultimo_arquivo), 
+                    file_types=tipos_arquivo
+            )
+            
+            if caminho_destino:
+                if not caminho_destino.lower().endswith(extensao_final): caminho_destino += extensao_final
+                shutil.copy(ultimo_arquivo, caminho_destino)
+                sg.popup("✅ Sucesso!", f"Arquivo de DADOS salvo em:\n{caminho_destino}\n\nO relatório foi salvo na pasta do programa.")
+            else: 
+                sg.popup("⚠ Atenção", f"Nenhum local escolhido. O arquivo de DADOS permanece em:\n{ultimo_arquivo}")
                 
                 window["-STATUS-"].update("Status: Concluído!"); window["-START-"].update(disabled=False); window["-CANCEL-"].update(disabled=True)
                 window["-PAUSE_EXTRACTION-"].update(disabled=True)

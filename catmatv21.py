@@ -10,6 +10,7 @@ from openpyxl import Workbook
 import shutil
 import json
 import threading
+import math
 
 pausar_extracao = threading.Event()
 pausar_busca_catmat = threading.Event()
@@ -83,7 +84,7 @@ def parse_csv_text(csv_text: str) -> pd.DataFrame:
     try:
         return pd.read_csv(StringIO("\n".join(lines)), sep=";", dtype=str, engine="python", on_bad_lines='warn', quoting=3)
     except Exception as e:
-        sg.popup_error(f"⚠ Error al leer CSV: {e}")
+        sg.popup_error(f"⚠ Erro ao ler CSV: {e}")
         return pd.DataFrame()
 
 def ler_pagina_catmat(codigo: int, pagina: int, URL_BASE, TAMANHO_PAGINA, TIMEOUT) -> Tuple[Optional[pd.DataFrame], Optional[str]]:
@@ -102,22 +103,29 @@ def ler_pagina_catmat(codigo: int, pagina: int, URL_BASE, TAMANHO_PAGINA, TIMEOU
             csv_text = resp.content.decode("utf-8-sig", errors="replace")
             return None, csv_text
         except requests.exceptions.ConnectionError as e:
-            return None, f"ERROR_CONEXION: Falla de conexión al buscar CATMAT {codigo}. Verifique su red. ({e})"
+            return None, f"ERRO_CONEXAO: Falha de conexão ao buscar CATMAT {codigo}. Verifique sua rede. ({e})"
         except requests.exceptions.RequestException as e:
-            return None, f"ERROR_SOLICITUD: Error de red al buscar CATMAT {codigo}: {e}"
+            return None, f"ERRO_REQUISICAO: Erro de rede ao buscar CATMAT {codigo}: {e}"
             
-    return None, f"ERROR_SOLICITUD: Error 429 (Too Many Requests) persistente para CATMAT {codigo}"
+    return None, f"ERRO_REQUISICAO: Erro 429 (Too Many Requests) persistente para CATMAT {codigo}"
 
 
 def buscar_pdms_por_classe(codigo_classe: int, URL_BASE: str, TIMEOUT: int) -> Optional[Tuple[pd.DataFrame, int]]:
     URL = f"{URL_BASE}/modulo-material/3_consultarPdmMaterial"
     all_pdms = []
     pagina_atual = 1
-    total_paginas = 1
+    total_paginas = 1  # Valor inicial provisório
     total_registros_api = 0
+    TAMANHO_PAGINA = 500 # Definimos uma constante para garantir consistência
 
     while pagina_atual <= total_paginas:
-        params = {"codigoClasse": codigo_classe, "pagina": pagina_atual, "bps": "false"}
+        params = {
+            "codigoClasse": codigo_classe, 
+            "pagina": pagina_atual, 
+            "tamanhoPagina": TAMANHO_PAGINA, 
+            "bps": "false"
+        }
+        
         try:
             resp = requests.get(URL, params=params, timeout=TIMEOUT, verify=False)
             resp.raise_for_status()
@@ -126,26 +134,39 @@ def buscar_pdms_por_classe(codigo_classe: int, URL_BASE: str, TIMEOUT: int) -> O
             if "resultado" in data:
                 all_pdms.extend(data["resultado"])
 
+            # Lógica de cálculo manual de páginas
             if pagina_atual == 1:
-                total_paginas = data.get("totalPaginas", 1)
-                total_registros_api = data.get("totalRegistros", 0)
+                total_registros_api = int(data.get("totalRegistros", 0))
+                
+                # SE a API diz que tem mais de 500 registros, calculamos as páginas na mão
+                if total_registros_api > 0:
+                    # Ex: 1875 / 500 = 3.75 -> Teto = 4 páginas
+                    total_paginas = math.ceil(total_registros_api / TAMANHO_PAGINA)
+                else:
+                    total_paginas = 1
+                
+                # Log de depuração (opcional, aparece no print do console)
+                print(f"DEBUG: Registros: {total_registros_api} | Páginas Calculadas: {total_paginas}")
 
             pagina_atual += 1
             time.sleep(0.5)
 
         except requests.exceptions.RequestException as e:
-            sg.popup_error(f"Error de red al buscar PDMs de la clase {codigo_classe} (página {pagina_atual}):\n{e}")
+            sg.popup_error(f"Erro de rede ao buscar PDMs da classe {codigo_classe} (página {pagina_atual}):\n{e}")
             return None
         except json.JSONDecodeError:
-            sg.popup_error(f"Falla al decodificar la respuesta JSON de la API para la clase {codigo_classe}.")
+            sg.popup_error(f"Falha ao decodificar a resposta JSON da API para a classe {codigo_classe}.")
             return None
 
     if not all_pdms:
         return None
 
     df = pd.DataFrame(all_pdms)
+    
+    # Validação final para garantir que não duplicamos dados se a API se comportar de forma estranha
+    df = df.drop_duplicates(subset=['codigoPdm'])
+    
     return df, total_registros_api
-
 
 def buscar_catmats_por_pdm(codigos_pdm: List[int], URL_BASE: str, TIMEOUT: int, window: sg.Window) -> Tuple[Optional[pd.DataFrame], List[int]]:
     global cancelar_busca_catmat
@@ -157,13 +178,13 @@ def buscar_catmats_por_pdm(codigos_pdm: List[int], URL_BASE: str, TIMEOUT: int, 
     for i, pdm_code in enumerate(codigos_pdm):
         pausar_busca_catmat.wait() 
         if cancelar_busca_catmat:
-            window['-STATUS_EXPLORADOR-'].update("Búsqueda cancelada por el usuario.")
+            window['-STATUS_EXPLORADOR-'].update("Busca cancelada pelo usuário.")
             break
 
         pagina_atual = 1
         total_paginas = 1
         
-        window['-STATUS_EXPLORADOR-'].update(f"Buscando CATMATs del PDM {pdm_code} ({i+1}/{total_pdms})...")
+        window['-STATUS_EXPLORADOR-'].update(f"Buscando CATMATs do PDM {pdm_code} ({i+1}/{total_pdms})...")
         window.refresh()
 
         while True: 
@@ -192,13 +213,13 @@ def buscar_catmats_por_pdm(codigos_pdm: List[int], URL_BASE: str, TIMEOUT: int, 
                 break 
 
             except requests.exceptions.RequestException as e:
-                window['-STATUS_EXPLORADOR-'].update(f"⚠️ Error en el PDM {pdm_code}. Añadido a la cola para un nuevo intento.")
+                window['-STATUS_EXPLORADOR-'].update(f"⚠️ Erro no PDM {pdm_code}. Adicionado à fila de nova tentativa.")
                 pdms_com_erro.append(pdm_code)
                 time.sleep(1)
                 break 
 
             except json.JSONDecodeError:
-                window['-STATUS_EXPLORADOR-'].update(f"⚠️ Error de JSON en el PDM {pdm_code}. Añadido a la cola para un nuevo intento.")
+                window['-STATUS_EXPLORADOR-'].update(f"⚠️ Erro de JSON no PDM {pdm_code}. Adicionado à fila de nova tentativa.")
                 pdms_com_erro.append(pdm_code)
                 time.sleep(1)
                 break
@@ -313,101 +334,101 @@ def processar_dataframe_final(df: pd.DataFrame, ordem_colunas: List[str]) -> pd.
 
 sg.theme('SystemDefaultForReal')
 
-welcome_message = """¡Hola! Bienvenido al Extractor de CATMATs DESID.
+welcome_message = """Olá! Bem-vindo ao Extrator de CATMATs Pro.
 
-¡Su herramienta para extraer y descubrir datos en el Portal de Compras Gubernamentales!
+Sua ferramenta para extrair e descobrir dados no Portal de Compras Governamentais!
 
-¿Qué hace este programa?
-Este programa tiene dos funciones principales en pestañas separadas:
+O que este programa faz?
+Este programa possui duas funções principais em abas separadas:
 
-1.  Extracción por CATMAT (Pestaña 1): Si ya tiene una lista de códigos de materiales (CATMATs), esta pestaña busca toda la información de compras, corrige problemas en los datos y consolida todo en un archivo de Excel.
+1.  Extração por CATMAT (Aba 1): Se você já tem uma lista de códigos de materiais (CATMATs), esta aba busca todas as informações de compras, corrige problemas nos dados e consolida tudo em um arquivo Excel.
 
-2.  Explorador de Clases (Pestaña 2): Si desea descubrir nuevos artículos, puede comenzar con el código de una Clase, encontrar todos los Patrones Descriptivos de Materiales (PDMs) dentro de ella y luego listar todos los CATMATs relacionados para la extracción.
+2.  Explorador de Classes (Aba 2): Se você quer descobrir novos itens, pode começar com o código de uma Classe, encontrar todos os Padrões Descritivos de Materiais (PDMs) dentro dela e, em seguida, listar todos os CATMATs relacionados para extração.
 
-Primeros Pasos:
-- Para una extracción directa con una lista lista, use la primera pestaña. El archivo de Excel debe iniciar la lista de CATMATs con el encabezado 'codigoItemCatalogo'.
-- Para descubrir artículos, comience por la segunda pestaña y, al final, envíe los CATMATs encontrados a la pestaña de extracción.
+Primeiros Passos:
+- Para uma extração direta com uma lista pronta, use a primeira aba, o arquivo excel deve iniciar a lista dos CATMATs com o cabeçalho codigoItemCatalogo.
+- Para descobrir itens, comece pela segunda aba e, ao final, envie os CATMATs encontrados para a extração na primeira aba.
 
-Siga todo el proceso en tiempo real aquí en este registro. ¡Buen trabajo!
+Acompanhe todo o processo em tempo real aqui neste log. Bom trabalho!
 """
 
 layout_extracao_config = [
-    [sg.Text("Archivo de Códigos:", size=(20,1)), sg.Input(key="-ARQUIVO-", enable_events=True, expand_x=True), sg.FileBrowse(button_text='Buscar', file_types=(("Excel Files", "*.xlsx"), ("CSV Files", "*.csv")))],
-    [sg.Checkbox('¿Guardar copias de los archivos CSV corruptos?', key='-SALVAR_CORROMPIDOS-', default=False, enable_events=True)],
-    [sg.Column([[sg.Text("Carpeta para Corruptos:", size=(20,1)), sg.Input(key="-PASTA-", enable_events=True, expand_x=True), sg.FolderBrowse(button_text='Buscar')]], key='-SECAO_PASTA_CORROMPIDOS-', visible=False)],
+    [sg.Text("Arquivo de Códigos:", size=(20,1)), sg.Input(key="-ARQUIVO-", enable_events=True, expand_x=True), sg.FileBrowse(button_text='Procurar', file_types=(("Excel Files", "*.xlsx"), ("CSV Files", "*.csv")))],
+    [sg.Checkbox('Salvar cópias dos arquivos CSV corrompidos?', key='-SALVAR_CORROMPIDOS-', default=False, enable_events=True)],
+    [sg.Column([[sg.Text("Pasta para Corrompidos:", size=(20,1)), sg.Input(key="-PASTA-", enable_events=True, expand_x=True), sg.FolderBrowse(button_text='Procurar')]], key='-SECAO_PASTA_CORROMPIDOS-', visible=False)],
 ]
 layout_extracao_stats = [
-    [sg.Text("Códigos Procesados:", size=(20,1)), sg.Text("0 / 0", key="-CONT_PROCESSADOS-", font=("Helvetica", 10, "bold"))],
+    [sg.Text("Códigos Processados:", size=(20,1)), sg.Text("0 / 0", key="-CONT_PROCESSADOS-", font=("Helvetica", 10, "bold"))],
     [sg.Text("Registros Consolidados:", size=(20,1)), sg.Text("0", key="-CONT_REGISTROS-", font=("Helvetica", 10, "bold"))],
-    [sg.Text("Páginas Corregidas:", size=(20,1)), sg.Text("0", key="-CONT_CORRIGIDAS-", font=("Helvetica", 10, "bold"), text_color="orange")],
-    [sg.Text("Códigos sin Datos:", size=(20,1)), sg.Text("0", key="-CONT_VAZIOS-", font=("Helvetica", 10, "bold"), text_color="#FF6347")],
+    [sg.Text("Páginas Corrigidas:", size=(20,1)), sg.Text("0", key="-CONT_CORRIGIDAS-", font=("Helvetica", 10, "bold"), text_color="orange")],
+    [sg.Text("Códigos sem Dados:", size=(20,1)), sg.Text("0", key="-CONT_VAZIOS-", font=("Helvetica", 10, "bold"), text_color="#FF6347")],
 ]
 layout_extracao_execucao = [
-    [sg.Text("Estado: Inactivo", key='-STATUS-', expand_x=True, font=("Helvetica", 10, "italic"))],
+    [sg.Text("Status: Ocioso", key='-STATUS-', expand_x=True, font=("Helvetica", 10, "italic"))],
     [sg.ProgressBar(max_value=1000, orientation='h', size=(50, 20), key='-PROGRESS-', expand_x=True), sg.Text('0%', size=(5,1), key='-PERCENT-', font=("Helvetica", 10, "bold"))],
     [sg.Multiline(default_text=welcome_message, size=(80,20), key="-OUTPUT-", autoscroll=True, expand_x=True, expand_y=True, background_color='black', text_color='white')],
 ]
 tab1_layout = [
-    [sg.Frame('1. Configuraciones de Entrada', layout_extracao_config, expand_x=True)],
-    [sg.Frame('2. Resumen de la Ejecución', layout_extracao_stats, expand_x=True)],
-    [sg.Frame('3. Registro y Progreso', layout_extracao_execucao, expand_x=True, expand_y=True)],
-    [sg.Button("Iniciar Extracción", key="-START-", disabled=True), sg.Button("Cancelar", key="-CANCEL-", disabled=True), 
+    [sg.Frame('1. Configurações de Entrada', layout_extracao_config, expand_x=True)],
+    [sg.Frame('2. Resumo da Execução', layout_extracao_stats, expand_x=True)],
+    [sg.Frame('3. Log e Progresso', layout_extracao_execucao, expand_x=True, expand_y=True)],
+    [sg.Button("Iniciar Extração", key="-START-", disabled=True), sg.Button("Cancelar", key="-CANCEL-", disabled=True), 
      sg.Button('Pausar', key='-PAUSE_EXTRACTION-', button_color=('white', 'darkblue'), disabled=True), 
-     sg.Button("Guardar Registro", key="-SAVE_LOG-", disabled=True)]
+     sg.Button("Salvar Log", key="-SAVE_LOG-", disabled=True)]
 ]
 
 COR_BOTAO_SELECIONADO = ('white', 'green')
 COR_BOTAO_PADRAO = ('white', 'grey')
 FILTRO_BOTOES = ['-FILTRO_TODOS-', '-FILTRO_ATIVOS-', '-FILTRO_INATIVOS-']
 
-pdm_headings = ['Código PDM', 'Descripción', 'Estado']
+pdm_headings = ['Código PDM', 'Descrição', 'Status']
 layout_explorador = [
-    [sg.Frame('1. Buscar PDMs por Clase', [[
-        sg.Text('Código de la Clase:'), 
+    [sg.Frame('1. Buscar PDMs por Classe', [[
+        sg.Text('Código da Classe:'), 
         sg.Input(key='-INPUT_CLASSE-', size=(10,1)), 
         sg.Button('Buscar PDMs', key='-BUSCAR_PDMS-'),
         sg.Push(),
         sg.Text("", key="-PDM_COUNT_DISPLAY-", font=("Helvetica", 10, "bold"))
     ]], expand_x=True)],
-    [sg.Frame('2. Resultados de la Búsqueda de PDMs', [[
+    [sg.Frame('2. Resultados da Busca de PDMs', [[
         sg.Text("Filtro:"), 
         sg.Button('Todos', key='-FILTRO_TODOS-', button_color=COR_BOTAO_SELECIONADO), 
-        sg.Button('Solo Activos', key='-FILTRO_ATIVOS-', button_color=COR_BOTAO_PADRAO), 
-        sg.Button('Solo Inactivos', key='-FILTRO_INATIVOS-', button_color=COR_BOTAO_PADRAO),
+        sg.Button('Apenas Ativos', key='-FILTRO_ATIVOS-', button_color=COR_BOTAO_PADRAO), 
+        sg.Button('Apenas Inativos', key='-FILTRO_INATIVOS-', button_color=COR_BOTAO_PADRAO),
         sg.Push(),
-        sg.Button("Exportar PDMs Visibles", key="-EXPORTAR_PDMS-"), 
-        sg.Checkbox('Seleccionar Todos los Visibles', key='-SELECIONAR_TODOS_PDM-', enable_events=True)
+        sg.Button("Exportar PDMs Visíveis", key="-EXPORTAR_PDMS-"), 
+        sg.Checkbox('Selecionar Todos Visíveis', key='-SELECIONAR_TODOS_PDM-', enable_events=True)
         ], [
         sg.Table(values=[], headings=pdm_headings, num_rows=15, key='-TABELA_PDMS-', enable_events=True, justification='left', auto_size_columns=False, col_widths=[10, 50, 8], expand_x=True, select_mode='extended')
     ]], expand_x=True, expand_y=True)],
     
-    [sg.Frame('Búsqueda Individual por PDMs', [
-        [sg.Text("Pegue los códigos PDM (uno por línea):"), sg.Push(), sg.Button('Buscar CATMATs (PDMs de la Lista)', key='-BUSCAR_PDMS_ESPECIFICOS-')],
+    [sg.Frame('Busca Avulsa por PDMs', [
+        [sg.Text("Cole os códigos PDM (um por linha):"), sg.Push(), sg.Button('Buscar CATMATs (PDMs da Lista)', key='-BUSCAR_PDMS_ESPECIFICOS-')],
         [sg.Multiline(size=(40, 8), key='-INPUT_PDMS_ESPECIFICOS-')]
     ], expand_x=True)],
     
-    [sg.Frame('3. Acciones', [[
-        sg.Button('Buscar CATMATs (PDMs de la Tabla)', key='-BUSCAR_CATMATS-'),
-        sg.Button('Buscar CATMATs e Iniciar Extracción', key='-BUSCAR_E_EXTRAIR-', button_color=('white', 'blue'), tooltip='Busca los CATMATs de los PDMs seleccionados e inicia la extracción de datos para ellos automáticamente.'),
+    [sg.Frame('3. Ações', [[
+        sg.Button('Buscar CATMATs (PDMs da Tabela)', key='-BUSCAR_CATMATS-'),
+        sg.Button('Buscar CATMATs e Iniciar Extração', key='-BUSCAR_E_EXTRAIR-', button_color=('white', 'blue'), tooltip='Busca os CATMATs dos PDMs selecionados e inicia a extração de dados para eles automaticamente.'),
         sg.Button('Exportar Lista de CATMATs', key='-EXPORTAR_CATMATS-', disabled=True),
         sg.Column([[
             sg.Text("", key="-STATUS_EXPLORADOR-", font=("Helvetica", 10, "italic")),
-            sg.Button('Pausar Búsqueda', key='-PAUSE_SEARCH-', button_color=('white', 'darkblue')), 
-            sg.Button('Cancelar Búsqueda', key='-CANCELAR_BUSCA_CATMAT-', button_color=('white', 'red'))
+            sg.Button('Pausar Busca', key='-PAUSE_SEARCH-', button_color=('white', 'darkblue')), 
+            sg.Button('Cancelar Busca', key='-CANCELAR_BUSCA_CATMAT-', button_color=('white', 'red'))
         ]], key='-COLUNA_CANCELAR_BUSCA-', visible=False)
         ],[
         sg.Column([[
-            sg.Button('Iniciar Extracción con CATMATs Encontrados', key='-INICIAR_EXTRACAO_EXPLORADOR-', disabled=True, button_color=('white', 'green'), tooltip='Haga clic aquí para enviar la lista de CATMATs encontrados a la pestaña de extracción e iniciar el proceso.')
+            sg.Button('Iniciar Extração com CATMATs Encontrados', key='-INICIAR_EXTRACAO_EXPLORADOR-', disabled=True, button_color=('white', 'green'), tooltip='Clique aqui para enviar a lista de CATMATs encontrados para a aba de extração e iniciar o processo.')
         ]], key='-COLUNA_INICIAR_EXTRACAO-', visible=False)
     ]], expand_x=True)],
 ]
 
 layout = [[sg.TabGroup([[
-    sg.Tab('Extracción por CATMAT', tab1_layout, key='-TAB_EXTRACAO-'),
-    sg.Tab('Explorador de Clases', layout_explorador, key='-TAB_EXPLORADOR-')
+    sg.Tab('Extração por CATMAT', tab1_layout, key='-TAB_EXTRACAO-'),
+    sg.Tab('Explorador de Classes', layout_explorador, key='-TAB_EXPLORADOR-')
 ]], key='-TAB_GROUP-', expand_x=True, expand_y=True)]]
 
-window = sg.Window("Extractor de CATMATs DESID", layout, resizable=True, finalize=True)
+window = sg.Window("Extrator de CATMATs Pro", layout, resizable=True, finalize=True)
 window.set_min_size((800, 700))
 
 window['-INPUT_CLASSE-'].bind('<Return>', '_Enter')
@@ -434,16 +455,16 @@ lista_catmats_descobertos = []
 cancelar_busca_catmat = False
 
 def buscar_catmats_thread(pdms_selecionados, window, acao_final='apenas_buscar'):
-    window.write_event_value('-UPDATE_STATUS_EXPLORADOR-', "Iniciando búsqueda... (1er intento)")
+    window.write_event_value('-UPDATE_STATUS_EXPLORADOR-', "Iniciando busca... (1ª tentativa)")
     df_passo1, pdms_para_tentar_novamente = buscar_catmats_por_pdm(pdms_selecionados, URL_BASE, TIMEOUT, window)
     
     df_passo2 = None
     pdms_falha_final = []
 
     if pdms_para_tentar_novamente and not cancelar_busca_catmat:
-        window.write_event_value('-UPDATE_STATUS_EXPLORADOR-', f"Esperando 5s antes del 2º intento para {len(pdms_para_tentar_novamente)} PDMs...")
+        window.write_event_value('-UPDATE_STATUS_EXPLORADOR-', f"Aguardando 5s antes da 2ª tentativa para {len(pdms_para_tentar_novamente)} PDMs...")
         time.sleep(5)
-        window.write_event_value('-UPDATE_STATUS_EXPLORADOR-', "Iniciando 2º intento...")
+        window.write_event_value('-UPDATE_STATUS_EXPLORADOR-', "Iniciando 2ª tentativa...")
         df_passo2, pdms_falha_final = buscar_catmats_por_pdm(pdms_para_tentar_novamente, URL_BASE, TIMEOUT, window)
 
     dfs_finais = []
@@ -473,7 +494,7 @@ def iniciar_processo_extracao(lista_codigos):
     global total_registros_baixados, paginas_corrigidas_count, codigos_vazios_count
     
     if not lista_codigos:
-        sg.popup_error("Ningún código para procesar.")
+        sg.popup_error("Nenhum código para processar.")
         return
 
     processing = True
@@ -491,7 +512,7 @@ def iniciar_processo_extracao(lista_codigos):
     total_registros_baixados, paginas_corrigidas_count, codigos_vazios_count = 0, 0, 0
     
     codes_iterator = iter(enumerate(codigos_para_processar, 1))
-    window["-STATUS-"].update("Estado: Procesando...")
+    window["-STATUS-"].update("Status: Processando...")
 
 while True:
     event, values = window.read(timeout=120)
@@ -515,50 +536,50 @@ while True:
             ARQUIVO_CODIGOS = values["-ARQUIVO-"]
             df_codigos = pd.read_excel(ARQUIVO_CODIGOS) if ARQUIVO_CODIGOS.lower().endswith(".xlsx") else pd.read_csv(ARQUIVO_CODIGOS, sep=";")
             if "codigoItemCatalogo" not in df_codigos.columns:
-                sg.popup_error("Error: El archivo de entrada debe tener la columna 'codigoItemCatalogo'.")
+                sg.popup_error("Erro: O arquivo de entrada deve ter a coluna 'codigoItemCatalogo'.")
                 continue
             lista_codigos = pd.Series(df_codigos["codigoItemCatalogo"]).dropna().astype(int).drop_duplicates().tolist()
-            window["-OUTPUT-"].print(f"🔎 {len(lista_codigos)} códigos únicos cargados del archivo.", text_color='lightblue')
+            window["-OUTPUT-"].print(f"🔎 {len(lista_codigos)} códigos únicos carregados do arquivo.", text_color='lightblue')
             iniciar_processo_extracao(lista_codigos)
         except Exception as e:
-            sg.popup_error(f"Ocurrió un error al leer el archivo de códigos:\n{e}")
+            sg.popup_error(f"Ocorreu um erro ao ler o arquivo de códigos:\n{e}")
 
     if event == '-INICIAR_EXTRACAO_EXPLORADOR-':
         if not lista_catmats_descobertos:
-            sg.popup_error("No se encontró o seleccionó ningún CATMAT.")
+            sg.popup_error("Nenhum CATMAT foi encontrado ou selecionado.")
         else:
             window['-TAB_EXTRACAO-'].select()
-            window["-OUTPUT-"].print(f"🔎 {len(lista_catmats_descobertos)} códigos descubiertos a través del explorador.", text_color='lightblue')
+            window["-OUTPUT-"].print(f"🔎 {len(lista_catmats_descobertos)} códigos descobertos via explorador.", text_color='lightblue')
             iniciar_processo_extracao(lista_catmats_descobertos)
 
     if event == "-CANCEL-" and processing:
         processing = False; codes_iterator = None
-        window["-STATUS-"].update("Estado: Cancelando..."); window["-OUTPUT-"].print("\n🛑 Proceso cancelado. Finalizando archivos...", text_color='yellow')
+        window["-STATUS-"].update("Status: Cancelando..."); window["-OUTPUT-"].print("\n🛑 Processo cancelado. Finalizando arquivos...", text_color='yellow')
         if writer:
             saved_parts = writer.finalize()
-            if saved_parts: window["-OUTPUT-"].print(f"💾 Datos parciales guardados en: {', '.join(saved_parts)}", text_color='yellow')
+            if saved_parts: window["-OUTPUT-"].print(f"💾 Dados parciais salvos em: {', '.join(saved_parts)}", text_color='yellow')
         window["-PROGRESS-"].update(0); window["-PERCENT-"].update('0%');
         window["-START-"].update(disabled=False); window["-CANCEL-"].update(disabled=True); window["-SAVE_LOG-"].update(disabled=False)
         window["-PAUSE_EXTRACTION-"].update(disabled=True)
-        window["-STATUS-"].update("Estado: Cancelado")
+        window["-STATUS-"].update("Status: Cancelado")
 
     if event == '-PAUSE_EXTRACTION-':
         if pausar_extracao.is_set():
             pausar_extracao.clear()
-            window['-PAUSE_EXTRACTION-'].update(text='Reanudar')
-            window['-STATUS-'].update("Estado: Pausado.")
+            window['-PAUSE_EXTRACTION-'].update(text='Retomar')
+            window['-STATUS-'].update("Status: Pausado.")
         else:
             pausar_extracao.set()
             window['-PAUSE_EXTRACTION-'].update(text='Pausar')
-            window['-STATUS-'].update("Estado: Reanudando extracción...")
+            window['-STATUS-'].update("Status: Retomando extração...")
 
     if event == "-SAVE_LOG-":
-        filepath = sg.popup_get_file("Guardar Registro de Ejecución", save_as=True, no_window=True, default_extension=".txt", file_types=(("Text Files", "*.txt"),))
+        filepath = sg.popup_get_file("Salvar Log de Execução", save_as=True, no_window=True, default_extension=".txt", file_types=(("Text Files", "*.txt"),))
         if filepath:
             try:
                 with open(filepath, 'w', encoding='utf-8') as f: f.write(values["-OUTPUT-"])
-                sg.popup_quick("¡Registro guardado con éxito!")
-            except Exception as e: sg.popup_error(f"No se pudo guardar el registro.\nError: {e}")
+                sg.popup_quick("Log salvo com sucesso!")
+            except Exception as e: sg.popup_error(f"Não foi possível salvar o log.\nErro: {e}")
 
     if event in ('-BUSCAR_PDMS-', '-INPUT_CLASSE-_Enter'):
         codigo_classe = values['-INPUT_CLASSE-']
@@ -571,11 +592,11 @@ while True:
             if resultado_busca is not None:
                 df_pdms, total_api = resultado_busca
                 
-                df_processado = df_pdms.rename(columns={'codigoPdm': 'Código PDM', 'nomePdm': 'Descripción', 'statusPdm': 'Estado'})
-                df_processado['Estado'] = df_processado['Estado'].apply(lambda x: 'Activo' if x else 'Inactivo')
+                df_processado = df_pdms.rename(columns={'codigoPdm': 'Código PDM', 'nomePdm': 'Descrição', 'statusPdm': 'Status'})
+                df_processado['Status'] = df_processado['Status'].apply(lambda x: 'Ativo' if x else 'Inativo')
                 lista_pdms_completa = df_processado
                 
-                window['-TABELA_PDMS-'].update(values=lista_pdms_completa[['Código PDM', 'Descripción', 'Estado']].values.tolist())
+                window['-TABELA_PDMS-'].update(values=lista_pdms_completa[['Código PDM', 'Descrição', 'Status']].values.tolist())
                 
                 total_encontrados = len(lista_pdms_completa)
                 window['-PDM_COUNT_DISPLAY-'].update(f"{total_encontrados} de {total_api} PDMs encontrados.")
@@ -585,36 +606,36 @@ while True:
                 window['-SELECIONAR_TODOS_PDM-'].update(value=False)
                 window['-EXPORTAR_CATMATS-'].update(disabled=True)
                 window['-COLUNA_INICIAR_EXTRACAO-'].update(visible=False)
-                window['-INICIAR_EXTRACAO_EXPLORADOR-'].update('Iniciar Extracción con CATMATs Encontrados')
+                window['-INICIAR_EXTRACAO_EXPLORADOR-'].update('Iniciar Extração com CATMATs Encontrados')
             else:
-                window['-STATUS_EXPLORADOR-'].update("No se encontraron PDMs o hubo un error en la búsqueda.")
+                window['-STATUS_EXPLORADOR-'].update("Nenhum PDM encontrado ou erro na busca.")
                 window['-PDM_COUNT_DISPLAY-'].update("")
                 lista_pdms_completa = pd.DataFrame()
                 window['-TABELA_PDMS-'].update(values=[])
         elif event == '-BUSCAR_PDMS-':
-            sg.popup_error("Por favor, ingrese un código de Clase válido (solo números).")
+            sg.popup_error("Por favor, insira um código de Classe válido (apenas números).")
             
     if event == '-EXPORTAR_PDMS-':
         dados_visiveis = window['-TABELA_PDMS-'].Values
         if not dados_visiveis:
-            sg.popup_error("No hay PDMs en la tabla para exportar.")
+            sg.popup_error("Não há PDMs na tabela para exportar.")
         else:
-            filepath = sg.popup_get_file("Guardar Lista de PDMs", save_as=True, no_window=True, default_extension=".csv", default_path="PDMs_exportados.csv", file_types=(("CSV Files", "*.csv"),))
+            filepath = sg.popup_get_file("Salvar Lista de PDMs", save_as=True, no_window=True, default_extension=".csv", default_path="PDMs_exportados.csv", file_types=(("CSV Files", "*.csv"),))
             if filepath:
                 try:
                     df_export = pd.DataFrame(dados_visiveis, columns=pdm_headings)
                     df_export.to_csv(filepath, index=False, sep=';', encoding='utf-8-sig')
-                    sg.popup_ok(f"Lista de PDMs visibles guardada con éxito en:\n{filepath}")
+                    sg.popup_ok(f"Lista de PDMs visíveis salva com sucesso em:\n{filepath}")
                 except Exception as e:
-                    sg.popup_error(f"No se pudo guardar la lista de PDMs.\nError: {e}")
+                    sg.popup_error(f"Não foi possível salvar a lista de PDMs.\nErro: {e}")
 
     if event in FILTRO_BOTOES:
         if not lista_pdms_completa.empty:
             atualizar_cores_filtro(event, window)
             df_filtrado = lista_pdms_completa
-            if event == '-FILTRO_ATIVOS-': df_filtrado = lista_pdms_completa[lista_pdms_completa['Estado'] == 'Activo']
-            elif event == '-FILTRO_INATIVOS-': df_filtrado = lista_pdms_completa[lista_pdms_completa['Estado'] == 'Inactivo']
-            window['-TABELA_PDMS-'].update(values=df_filtrado[['Código PDM', 'Descripción', 'Estado']].values.tolist())
+            if event == '-FILTRO_ATIVOS-': df_filtrado = lista_pdms_completa[lista_pdms_completa['Status'] == 'Ativo']
+            elif event == '-FILTRO_INATIVOS-': df_filtrado = lista_pdms_completa[lista_pdms_completa['Status'] == 'Inativo']
+            window['-TABELA_PDMS-'].update(values=df_filtrado[['Código PDM', 'Descrição', 'Status']].values.tolist())
             window['-SELECIONAR_TODOS_PDM-'].update(value=False)
 
     if event == '-SELECIONAR_TODOS_PDM-':
@@ -628,14 +649,14 @@ while True:
         pdms_selecionados = []
         if event in ('-BUSCAR_CATMATS-', '-BUSCAR_E_EXTRAIR-'):
             indices_selecionados = window['-TABELA_PDMS-'].SelectedRows
-            if not indices_selecionados: sg.popup_error("Seleccione al menos un PDM en la tabla.")
+            if not indices_selecionados: sg.popup_error("Selecione pelo menos um PDM na tabela.")
             else:
                 dados_tabela = window['-TABELA_PDMS-'].Values
                 pdms_selecionados = [int(dados_tabela[i][0]) for i in indices_selecionados if i < len(dados_tabela)]
         else:
             pdms_texto = values['-INPUT_PDMS_ESPECIFICOS-']
             if not pdms_texto.strip():
-                sg.popup_error("Por favor, ingrese al menos un código PDM en el cuadro de búsqueda individual.")
+                sg.popup_error("Por favor, insira pelo menos um código PDM na caixa de busca avulsa.")
             else:
                 pdms_invalidos = []
                 for linha in pdms_texto.strip().split('\n'):
@@ -644,12 +665,12 @@ while True:
                     except ValueError:
                         if linha.strip(): pdms_invalidos.append(linha.strip())
                 if pdms_invalidos:
-                    sg.popup_error(f"Los siguientes valores no son válidos y fueron ignorados:\n{', '.join(pdms_invalidos)}")
+                    sg.popup_error(f"Os seguintes valores são inválidos e foram ignorados:\n{', '.join(pdms_invalidos)}")
         
         if pdms_selecionados:
             cancelar_busca_catmat = False
             pausar_busca_catmat.set() 
-            window['-PAUSE_SEARCH-'].update(text='Pausar Búsqueda')
+            window['-PAUSE_SEARCH-'].update(text='Pausar Busca')
             window['-BUSCAR_CATMATS-'].update(disabled=True); window['-BUSCAR_E_EXTRAIR-'].update(disabled=True)
             window['-BUSCAR_PDMS_ESPECIFICOS-'].update(disabled=True)
             window['-COLUNA_CANCELAR_BUSCA-'].update(visible=True)
@@ -663,12 +684,12 @@ while True:
     if event == '-PAUSE_SEARCH-':
         if pausar_busca_catmat.is_set():
             pausar_busca_catmat.clear()
-            window['-PAUSE_SEARCH-'].update(text='Reanudar Búsqueda')
-            window['-STATUS_EXPLORADOR-'].update("Búsqueda pausada.")
+            window['-PAUSE_SEARCH-'].update(text='Retomar Busca')
+            window['-STATUS_EXPLORADOR-'].update("Busca pausada.")
         else:
             pausar_busca_catmat.set()
-            window['-PAUSE_SEARCH-'].update(text='Pausar Búsqueda')
-            window['-STATUS_EXPLORADOR-'].update("Reanudando búsqueda...")
+            window['-PAUSE_SEARCH-'].update(text='Pausar Busca')
+            window['-STATUS_EXPLORADOR-'].update("Retomando busca...")
 
     if event == '-THREAD_CATMAT_CONCLUIDA-':
         resultado = values[event]
@@ -684,13 +705,13 @@ while True:
             lista_catmats_descobertos = df_catmats['codigoItem'].dropna().astype(int).tolist()
             num_catmats = len(lista_catmats_descobertos)
 
-            status_msg = f"✅ ¡{num_catmats} CATMATs encontrados!"
+            status_msg = f"✅ {num_catmats} CATMATs encontrados!"
             if falhas_finais:
-                status_msg += f" ⚠ Falla al buscar {len(falhas_finais)} PDMs."
-                sg.popup_warning(f"La búsqueda ha finalizado, pero no fue posible obtener datos de los siguientes PDMs, incluso después de dos intentos:\n\n{', '.join(map(str, falhas_finais))}")
+                status_msg += f" ⚠ Falha ao buscar {len(falhas_finais)} PDMs."
+                sg.popup_warning(f"A busca foi concluída, mas não foi possível obter dados dos seguintes PDMs, mesmo após duas tentativas:\n\n{', '.join(map(str, falhas_finais))}")
 
             window['-STATUS_EXPLORADOR-'].update(status_msg)
-            window['-INICIAR_EXTRACAO_EXPLORADOR-'].update(f'Iniciar Extracción con {num_catmats} CATMATs Encontrados')
+            window['-INICIAR_EXTRACAO_EXPLORADOR-'].update(f'Iniciar Extração com {num_catmats} CATMATs Encontrados')
             window['-EXPORTAR_CATMATS-'].update(disabled=False)
             window['-COLUNA_INICIAR_EXTRACAO-'].update(visible=True)
             window['-INICIAR_EXTRACAO_EXPLORADOR-'].update(disabled=False)
@@ -700,17 +721,17 @@ while True:
         else:
             lista_catmats_descobertos = []
             if not cancelar_busca_catmat:
-                window['-STATUS_EXPLORADOR-'].update("No se encontró ningún CATMAT.")
+                window['-STATUS_EXPLORADOR-'].update("Nenhum CATMAT encontrado.")
             window['-EXPORTAR_CATMATS-'].update(disabled=True)
             window['-COLUNA_INICIAR_EXTRACAO-'].update(visible=False)
             window['-INICIAR_EXTRACAO_EXPLORADOR-'].update(disabled=True)
             
     if event == '-EXPORTAR_CATMATS-':
         if not lista_catmats_descobertos:
-            sg.popup_error("No hay CATMATs en la lista para exportar. Realice una búsqueda primero.")
+            sg.popup_error("Não há CATMATs na lista para exportar. Realize uma busca primeiro.")
         else:
             filepath = sg.popup_get_file(
-                "Guardar Lista de CATMATs",
+                "Salvar Lista de CATMATs",
                 save_as=True,
                 no_window=True,
                 default_extension=".csv",
@@ -721,28 +742,28 @@ while True:
                 try:
                     df_export = pd.DataFrame(lista_catmats_descobertos, columns=['codigoItemCatalogo'])
                     df_export.to_csv(filepath, index=False, sep=';')
-                    sg.popup_ok(f"Lista con {len(df_export)} CATMATs guardada con éxito en:\n{filepath}")
+                    sg.popup_ok(f"Lista com {len(df_export)} CATMATs salva com sucesso em:\n{filepath}")
                 except Exception as e:
-                    sg.popup_error(f"No se pudo guardar la lista.\nError: {e}")
+                    sg.popup_error(f"Não foi possível salvar a lista.\nErro: {e}")
 
     if processing:
         pausar_extracao.wait() 
         try:
             idx, codigo = next(codes_iterator)
             total_codigos = len(codigos_para_processar)
-            window["-STATUS-"].update(f"Estado: Procesando código {codigo} ({idx}/{total_codigos})")
+            window["-STATUS-"].update(f"Status: Processando código {codigo} ({idx}/{total_codigos})")
             window["-CONT_PROCESSADOS-"].update(f"{idx} / {total_codigos}")
             
             pagina_atual, total_paginas, baixados_do_codigo = 1, None, 0
             
             try:
                 _, csv_text = ler_pagina_catmat(codigo, pagina_atual, URL_BASE, 500, TIMEOUT)
-                if csv_text and csv_text.startswith("ERROR_CONEXION"):
+                if csv_text and csv_text.startswith("ERRO_CONEXAO"):
                     sg.popup_error(csv_text)
                     processing = False 
                     raise StopIteration
-                if csv_text is None or csv_text.startswith("ERROR_SOLICITUD"):
-                    window["-OUTPUT-"].print(f"ℹ️ Código {codigo}: Falla o ningún registro. {csv_text or ''}", text_color='lightblue'); codigos_vazios_count += 1; window["-CONT_VAZIOS-"].update(codigos_vazios_count)
+                if csv_text is None or csv_text.startswith("ERRO_REQUISICAO"):
+                    window["-OUTPUT-"].print(f"ℹ️ Código {codigo}: Falha ou nenhum registro. {csv_text or ''}", text_color='lightblue'); codigos_vazios_count += 1; window["-CONT_VAZIOS-"].update(codigos_vazios_count)
                     raise StopIteration 
                 
                 m_reg = re.search(r"totalRegistros\s*:\s*(\d+)", csv_text, re.IGNORECASE)
@@ -761,10 +782,10 @@ while True:
                             path = os.path.join(values['-PASTA-'], f"cod_{codigo}_pag_{pagina_atual}_corrompido.csv")
                             with open(path, 'w', encoding='utf-8-sig') as f: f.write(csv_text)
                         
-                        window["-OUTPUT-"].print(f"⚠️ Cód {codigo}, Pág {pagina_atual}: Corregida.", text_color='orange')
+                        window["-OUTPUT-"].print(f"⚠️ Cód {codigo}, Pág {pagina_atual}: Corrigida.", text_color='orange')
                         paginas_corrigidas_count += 1; window["-CONT_CORRIGIDAS-"].update(paginas_corrigidas_count)
                     else:
-                        window["-OUTPUT-"].print(f"✅ Cód {codigo}, Pág {pagina_atual}: Leída con éxito.", text_color='lightgreen')
+                        window["-OUTPUT-"].print(f"✅ Cód {codigo}, Pág {pagina_atual}: Lida com sucesso.", text_color='lightgreen')
 
                     if df_final_pagina is not None and not df_final_pagina.empty:
                         df_final_pagina.loc[:, "codigoItemCatalogo"] = str(codigo)
@@ -788,7 +809,7 @@ while True:
                     if csv_text is None or csv_text.startswith("ERRO_"): break
 
             except StopIteration: pass
-            except Exception as e: window["-OUTPUT-"].print(f"❌ Error crítico en el código {codigo}: {e}", text_color='#FF6347')
+            except Exception as e: window["-OUTPUT-"].print(f"❌ Erro crítico no código {codigo}: {e}", text_color='#FF6347')
             registros_baixados[codigo] = baixados_do_codigo
             
             percent_complete = int((idx / total_codigos) * 100)
@@ -797,26 +818,26 @@ while True:
 
         except StopIteration: 
             window['-PROGRESS-'].update(1000); window['-PERCENT-'].update('100%')
-            window["-STATUS-"].update("Estado: ¡Procesamiento concluido! Generando informe...")
+            window["-STATUS-"].update("Status: Processamento concluído! Gerando relatório...")
             window.refresh()
             
             processing = False
-            window["-OUTPUT-"].print("\n🎉 ¡Descarga completada! Generando archivo final...", text_color='lightblue')
+            window["-OUTPUT-"].print("\n🎉 Download concluído! Gerando arquivo final...", text_color='lightblue')
 
             saved_parts = writer.finalize()
             if not saved_parts:
-                sg.popup("No se descargaron datos válidos. El informe no se generará.")
+                sg.popup("Nenhum dado válido foi baixado. O relatório não será gerado.")
                 window["-START-"].update(disabled=False); window["-CANCEL-"].update(disabled=True); window["-SAVE_LOG-"].update(disabled=False)
                 window["-PAUSE_EXTRACTION-"].update(disabled=True)
-                window["-STATUS-"].update("Estado: Inactivo")
+                window["-STATUS-"].update("Status: Ocioso")
                 
             else: 
-                window["-OUTPUT-"].print(f"💾 Archivos de datos guardados en: {', '.join(saved_parts)}", text_color='lightblue')
+                window["-OUTPUT-"].print(f"💾 Arquivos de dados salvos em: {', '.join(saved_parts)}", text_color='lightblue')
                 
                 wb_rel = Workbook()
                 ws_rel = wb_rel.active
-                ws_rel.title = "Informe de Integridad"
-                ws_rel.append(["codigoItemCatalogo", "registros_esperados_api", "registros_descargados_reales", "paginas_con_problemas", "estado"])
+                ws_rel.title = "Relatório Integridade"
+                ws_rel.append(["codigoItemCatalogo", "registros_esperados_api", "registros_baixados_reais", "paginas_com_problemas", "status"])
                 for c in codigos_para_processar:
                     baixados = int(registros_baixados.get(c, 0))
                     esperados = int(registros_esperados.get(c, 0))
@@ -827,37 +848,37 @@ while True:
                     if diferenca == 0:
                         status = "OK"
                     elif diferenca <= 2:
-                        status = f"OK (Pequeña discrepancia API: {baixados}/{esperados})"
+                        status = f"OK (Pequena divergência API: {baixados}/{esperados})"
                     else:
-                        status = f"Inconsistencia Grave (Descargados: {baixados} / Esperados: {esperados})"
+                        status = f"Inconsistência Grave (Baixados: {baixados} / Esperados: {esperados})"
 
                     ws_rel.append([c, esperados, baixados, ", ".join(map(str, paginas)), status])
                 
-                report_filename = "Informe_Integridad.xlsx"
+                report_filename = "Relatorio_Integridade.xlsx"
                 try:
                     wb_rel.save(report_filename)
-                    window["-OUTPUT-"].print(f"📊 Informe de integridad guardado en archivo separado: {report_filename}", text_color='lightblue')
+                    window["-OUTPUT-"].print(f"📊 Relatório de integridade salvo em arquivo separado: {report_filename}", text_color='lightblue')
                 except Exception as e:
-                    sg.popup_error(f"No se pudo guardar el archivo de informe:\n{e}")
+                    sg.popup_error(f"Não foi possível salvar o arquivo de relatório:\n{e}")
                 
                 resumo_final = f"""
-    ✅ ¡Proceso Concluido!
+    ✅ Processo Concluído!
     -------------------------------------------
-      - Códigos Procesados: {len(codigos_para_processar)}
+      - Códigos Processados: {len(codigos_para_processar)}
       - Registros Consolidados: {f"{total_registros_baixados:,}".replace(",", ".")}
-      - Páginas Corregidas: {paginas_corrigidas_count}
-      - Códigos sin Registros: {codigos_vazios_count}
+      - Páginas Corrigidas: {paginas_corrigidas_count}
+      - Códigos sem Registros: {codigos_vazios_count}
     -------------------------------------------"""
-                sg.popup('Resumen de la Extracción', resumo_final)
+                sg.popup('Resumo da Extração', resumo_final)
                 
                 ultimo_arquivo = saved_parts[-1]
-                caminho_destino = sg.popup_get_file("Elija dónde guardar el archivo de DATOS principal", save_as=True, no_window=True, default_path=os.path.basename(ultimo_arquivo), file_types=(("Archivos de Excel", "*.xlsx"),))
+                caminho_destino = sg.popup_get_file("Escolha onde salvar o arquivo de DADOS principal", save_as=True, no_window=True, default_path=os.path.basename(ultimo_arquivo), file_types=(("Arquivos Excel", "*.xlsx"),))
                 if caminho_destino:
                     if not caminho_destino.lower().endswith(".xlsx"): caminho_destino += ".xlsx"
-                    shutil.copy(ultimo_arquivo, caminho_destino); sg.popup("✅ ¡Éxito!", f"Archivo de DATOS guardado en:\n{caminho_destino}\n\nEl informe se guardó en la carpeta del programa.")
-                else: sg.popup("⚠ Atención", f"No se eligió ninguna ubicación. El archivo de DATOS permanece en:\n{ultimo_arquivo}")
+                    shutil.copy(ultimo_arquivo, caminho_destino); sg.popup("✅ Sucesso!", f"Arquivo de DADOS salvo em:\n{caminho_destino}\n\nO relatório foi salvo na pasta do programa.")
+                else: sg.popup("⚠ Atenção", f"Nenhum local escolhido. O arquivo de DADOS permanece em:\n{ultimo_arquivo}")
                 
-                window["-STATUS-"].update("Estado: ¡Concluido!"); window["-START-"].update(disabled=False); window["-CANCEL-"].update(disabled=True)
+                window["-STATUS-"].update("Status: Concluído!"); window["-START-"].update(disabled=False); window["-CANCEL-"].update(disabled=True)
                 window["-PAUSE_EXTRACTION-"].update(disabled=True)
                 window["-SAVE_LOG-"].update(disabled=False)
 
