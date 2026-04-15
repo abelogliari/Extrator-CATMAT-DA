@@ -344,7 +344,7 @@ def buscar_catmats_por_pdm(codigos_pdm, URL_BASE, TIMEOUT, app,
                     total_paginas = data.get("totalPaginas", 1)
                 pagina_atual += 1
                 if pagina_atual <= total_paginas:
-                    time.sleep(0.1)                   # throttle entre páginas do mesmo PDM
+                    time.sleep(0.2)                   # throttle entre páginas do mesmo PDM
         except Exception:
             with lock:
                 pdms_com_erro.append(pdm_code)
@@ -427,7 +427,7 @@ def _fetch_catmat_registros(codigo, d_ini, d_fim, salvar_corr, pasta_corr):
             pagina_atual += 1
             if pagina_atual > total_paginas:
                 break
-            time.sleep(0.1)
+            time.sleep(0.5)
             _, csv_text = ler_pagina_catmat(codigo, pagina_atual, URL_BASE, 500, TIMEOUT,
                                             d_ini, d_fim)
             if csv_text is None or csv_text.startswith("ERRO_"):
@@ -1433,7 +1433,7 @@ class App(ctk.CTk):
                         total_paginas = int(mp.group(1)) if mp else 1
                     pagina_atual += 1
                     if pagina_atual > total_paginas: break
-                    time.sleep(0.1)
+                    time.sleep(0.5)
                     _, csv_text = ler_pagina_catmat(codigo, pagina_atual, URL_BASE,
                                                     500, TIMEOUT, d_ini, d_fim)
                     if csv_text is None or csv_text.startswith("ERRO_"): break
@@ -1576,7 +1576,7 @@ class App(ctk.CTk):
                 return tipo
 
             # Extração paralela (4 workers)
-            with ThreadPoolExecutor(max_workers=4) as executor:
+            with ThreadPoolExecutor(max_workers=1) as executor:
                 futures = {
                     executor.submit(_fetch_catmat_registros, cod,
                                     d_ini, d_fim, salvar_corr, pasta_corr): cod
@@ -1591,7 +1591,7 @@ class App(ctk.CTk):
                     if res == "conexao": break
 
             # Retry paralelo dos CATMATs com erro
-            for espera in [3, 8]:
+            for espera in [15, 30]:
                 if not catmats_com_erro or not self.processing: break
                 n_err = len(catmats_com_erro)
                 self._ui(lambda n=n_err, e=espera:
@@ -1599,7 +1599,7 @@ class App(ctk.CTk):
                               str(e) + "s)…", "warn"))
                 time.sleep(espera)
                 retry_list = list(catmats_com_erro); catmats_com_erro.clear()
-                with ThreadPoolExecutor(max_workers=4) as executor:
+                with ThreadPoolExecutor(max_workers=1) as executor:
                     futures = {
                         executor.submit(_fetch_catmat_registros, cod,
                                         d_ini, d_fim, salvar_corr, pasta_corr): cod
@@ -1810,7 +1810,7 @@ class App(ctk.CTk):
                 writer_locks[k] = threading.Lock()
             return w, writer_locks[k]
 
-        with ThreadPoolExecutor(max_workers=4) as executor:
+        with ThreadPoolExecutor(max_workers=1) as executor:
             futures = {
                 executor.submit(_fetch_catmat_registros, cod,
                                 d_ini, d_fim, salvar_corr, pasta_corr): cod
@@ -2282,7 +2282,7 @@ def buscar_catmats_por_pdm(codigos_pdm, URL_BASE, TIMEOUT, app,
                     total_paginas = data.get("totalPaginas", 1)
                 pagina_atual += 1
                 if pagina_atual <= total_paginas:
-                    time.sleep(0.1)                   # throttle entre páginas do mesmo PDM
+                    time.sleep(0.2)                   # throttle entre páginas do mesmo PDM
         except Exception:
             with lock:
                 pdms_com_erro.append(pdm_code)
