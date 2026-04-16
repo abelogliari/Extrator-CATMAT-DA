@@ -5,6 +5,7 @@ Identidade visual: inspirada no BPS / DESID (Gov.br)
 """
 
 import re
+import csv
 import requests
 import pandas as pd
 from io import StringIO
@@ -188,11 +189,17 @@ def validar_e_obter_datas(ini: str, fim: str):
 
 
 def parse_csv_text(csv_text: str) -> pd.DataFrame:
-    lines = [ln for ln in csv_text.splitlines() if ln.strip()]
+    # Remove linhas vazias e artefatos de aspas soltas (ex: linha contendo só '"')
+    # que surgem quando um campo de texto contém quebras de linha internas
+    lines = [ln for ln in csv_text.splitlines()
+             if ln.strip() and ln.strip().strip('"').strip() != ""]
     if not lines: return pd.DataFrame()
     try:
+        # QUOTE_MINIMAL respeita aspas duplas como delimitadores de campo,
+        # tratando corretamente campos que contêm ponto-e-vírgula ou quebras de linha
         return pd.read_csv(StringIO("\n".join(lines)), sep=";", dtype=str,
-                           engine="python", on_bad_lines="warn", quoting=3)
+                           engine="python", on_bad_lines="skip",
+                           quoting=csv.QUOTE_MINIMAL)
     except Exception:
         return pd.DataFrame()
 
@@ -440,27 +447,53 @@ def _fetch_catmat_registros(codigo, d_ini, d_fim, salvar_corr, pasta_corr):
 
 
 def pagina_corrompida(csv_text: str):
+    """
+    Detecta e corrige dois tipos de corrupção no CSV da API:
+    1. Linhas fragmentadas (< ncols campos) — campos com \n interno
+    2. Linhas com aspas soltas (campo contendo só '"') — artefato de \n em campo com aspas
+    Retorna (houve_correcao, csv_corrigido).
+    """
     if not csv_text: return False, csv_text
     linhas = [ln for ln in csv_text.splitlines() if ln.strip()]
     if not linhas: return False, csv_text
     try:
         hi = next(i for i, ln in enumerate(linhas)
                   if not ln.lower().startswith(("totalregistros:", "totalpaginas:")))
-        header_line = linhas[hi]; ncols = len(header_line.split(";"))
+        header_line = linhas[hi]
+        ncols = len(header_line.split(";"))
     except StopIteration:
         return False, csv_text
     if ncols == 0: return False, csv_text
+
     out = list(linhas[:hi]) + [header_line]
     buf = ""; corrigido = False
+
     for ln in linhas[hi+1:]:
         if ln.lower().startswith(("totalregistros:", "totalpaginas:")):
             if buf: out.append(buf); buf = ""
             out.append(ln); continue
-        atual = buf + ln.replace("\r","").replace("\n","")
-        if len(atual.split(";")) < ncols:
-            buf = atual + " "; corrigido = True
-        else:
+
+        # Descartar artefatos de aspas soltas (tipo 2)
+        if ln.strip().strip('"').strip() == "":
+            corrigido = True; continue
+
+        atual = (buf + " " + ln).strip() if buf else ln
+        n = len(atual.split(";"))
+
+        if n < ncols:
+            # Fragmento — acumular (tipo 1)
+            buf = atual; corrigido = True
+        elif n == ncols:
             out.append(atual); buf = ""
+        else:
+            # Excesso de colunas: se a linha sozinha tem ncols, usar ela diretamente
+            if len(ln.split(";")) == ncols:
+                if buf: corrigido = True
+                out.append(ln); buf = ""
+            else:
+                # Manter como está — parse_csv_text vai lidar com on_bad_lines="skip"
+                out.append(atual); buf = ""; corrigido = True
+
     if buf: out.append(buf)
     return corrigido, "\n".join(out)
 
@@ -2158,11 +2191,17 @@ def validar_e_obter_datas(ini: str, fim: str):
 
 
 def parse_csv_text(csv_text: str) -> pd.DataFrame:
-    lines = [ln for ln in csv_text.splitlines() if ln.strip()]
+    # Remove linhas vazias e artefatos de aspas soltas (ex: linha contendo só '"')
+    # que surgem quando um campo de texto contém quebras de linha internas
+    lines = [ln for ln in csv_text.splitlines()
+             if ln.strip() and ln.strip().strip('"').strip() != ""]
     if not lines: return pd.DataFrame()
     try:
+        # QUOTE_MINIMAL respeita aspas duplas como delimitadores de campo,
+        # tratando corretamente campos que contêm ponto-e-vírgula ou quebras de linha
         return pd.read_csv(StringIO("\n".join(lines)), sep=";", dtype=str,
-                           engine="python", on_bad_lines="warn", quoting=3)
+                           engine="python", on_bad_lines="skip",
+                           quoting=csv.QUOTE_MINIMAL)
     except Exception:
         return pd.DataFrame()
 
@@ -2313,27 +2352,53 @@ def buscar_catmats_por_pdm(codigos_pdm, URL_BASE, TIMEOUT, app,
 
 
 def pagina_corrompida(csv_text: str):
+    """
+    Detecta e corrige dois tipos de corrupção no CSV da API:
+    1. Linhas fragmentadas (< ncols campos) — campos com \n interno
+    2. Linhas com aspas soltas (campo contendo só '"') — artefato de \n em campo com aspas
+    Retorna (houve_correcao, csv_corrigido).
+    """
     if not csv_text: return False, csv_text
     linhas = [ln for ln in csv_text.splitlines() if ln.strip()]
     if not linhas: return False, csv_text
     try:
         hi = next(i for i, ln in enumerate(linhas)
                   if not ln.lower().startswith(("totalregistros:", "totalpaginas:")))
-        header_line = linhas[hi]; ncols = len(header_line.split(";"))
+        header_line = linhas[hi]
+        ncols = len(header_line.split(";"))
     except StopIteration:
         return False, csv_text
     if ncols == 0: return False, csv_text
+
     out = list(linhas[:hi]) + [header_line]
     buf = ""; corrigido = False
+
     for ln in linhas[hi+1:]:
         if ln.lower().startswith(("totalregistros:", "totalpaginas:")):
             if buf: out.append(buf); buf = ""
             out.append(ln); continue
-        atual = buf + ln.replace("\r","").replace("\n","")
-        if len(atual.split(";")) < ncols:
-            buf = atual + " "; corrigido = True
-        else:
+
+        # Descartar artefatos de aspas soltas (tipo 2)
+        if ln.strip().strip('"').strip() == "":
+            corrigido = True; continue
+
+        atual = (buf + " " + ln).strip() if buf else ln
+        n = len(atual.split(";"))
+
+        if n < ncols:
+            # Fragmento — acumular (tipo 1)
+            buf = atual; corrigido = True
+        elif n == ncols:
             out.append(atual); buf = ""
+        else:
+            # Excesso de colunas: se a linha sozinha tem ncols, usar ela diretamente
+            if len(ln.split(";")) == ncols:
+                if buf: corrigido = True
+                out.append(ln); buf = ""
+            else:
+                # Manter como está — parse_csv_text vai lidar com on_bad_lines="skip"
+                out.append(atual); buf = ""; corrigido = True
+
     if buf: out.append(buf)
     return corrigido, "\n".join(out)
 
