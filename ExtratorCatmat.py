@@ -382,7 +382,10 @@ def buscar_catmats_por_pdm(codigos_pdm, URL_BASE, TIMEOUT, app,
 
 
 
-def _fetch_catmat_registros(codigo, d_ini, d_fim, salvar_corr, pasta_corr):
+def _fetch_catmat_registros(codigo, d_ini, d_fim, salvar_corr, pasta_corr,
+                            _pausar_conexao_fn=None):
+    if _pausar_conexao_fn is None:
+        _pausar_conexao_fn = lambda: None  # no-op se não fornecida
     """
     Worker puro: busca e processa todas as páginas de um CATMAT.
     Pode rodar em qualquer thread — não acessa estado compartilhado.
@@ -396,9 +399,21 @@ def _fetch_catmat_registros(codigo, d_ini, d_fim, salvar_corr, pasta_corr):
     pagina_atual = 1; total_paginas = None
 
     try:
-        _, csv_text = ler_pagina_catmat(codigo, 1, URL_BASE, 500, TIMEOUT, d_ini, d_fim)
-        if csv_text and csv_text.startswith("ERRO_CONEXAO"):
-            return codigo, [], "conexao", 0, {}
+        while True:
+            _, csv_text = ler_pagina_catmat(codigo, 1, URL_BASE, 500, TIMEOUT, d_ini, d_fim)
+            if csv_text and csv_text.startswith("ERRO_CONEXAO"):
+                # Pausa automática + contagem regressiva de 60s antes de retentar
+                _pausar_conexao_fn()
+                for seg_restante in range(60, 0, -1):
+                    # Se o usuário clicar Retomar manualmente, interrompe a contagem
+                    if pausar_extracao.is_set():
+                        break
+                    time.sleep(1)
+                # Retoma automaticamente ao fim da contagem (ou imediatamente se
+                # o usuário já clicou Retomar)
+                pausar_extracao.set()
+                continue
+            break
         if csv_text is None or csv_text.startswith("ERRO_REQUISICAO"):
             return codigo, [], "erro", 0, {}
 
@@ -1065,6 +1080,25 @@ class App(ctk.CTk):
             self.btn_pause.configure(text="⏸  Pausar")
             self.set_status("Status: Retomando…")
 
+    def _pausar_por_conexao(self):
+        """Pausa automática ao detectar queda de rede — NÃO cancela a extração.
+        Retoma automaticamente em 60s ou imediatamente se o usuário clicar Retomar."""
+        if not self.processing: return
+        # Só loga/pausa se ainda não estava pausado por conexão
+        if not pausar_extracao.is_set(): return  # já está pausado
+        pausar_extracao.clear()
+        self.btn_pause.configure(state="normal", text="▶  Retomar agora")
+        self.set_status("Status: Sem conexão — retentando em 60s")
+        self._log("\n⚠️  Rede indisponível — retentando automaticamente em 60s.\n"
+                  "   Clique em ▶  Retomar agora para tentar imediatamente.", "warn")
+        # Atualizar contagem regressiva no status a cada segundo
+        def _countdown(seg):
+            if not self.processing or pausar_extracao.is_set(): return
+            self.set_status(f"Status: Sem conexão — retentando em {seg}s")
+            if seg > 0:
+                self.after(1000, lambda: _countdown(seg - 1))
+        self.after(1000, lambda: _countdown(59))
+
     def _salvar_log(self):
         p = filedialog.asksaveasfilename(defaultextension=".txt",
                                          filetypes=[("Texto","*.txt")])
@@ -1554,10 +1588,7 @@ class App(ctk.CTk):
             def _processar_resultado(codigo, dfs_e_meta, tipo, reg_esp, pag_corr):
                 nonlocal total_baixados_classe, vazios_classe, total_catmats_acum
                 if tipo == "conexao":
-                    self._ui(lambda: messagebox.showerror("Conexão",
-                        "Erro de conexão com a API. Verifique sua rede."))
-                    self.processing = False
-                    return "conexao"
+                    pass  # já tratado dentro de _fetch_catmat_registros via pausa automática
                 elif tipo == "erro":
                     with state_lock:
                         catmats_com_erro.append(codigo)
@@ -1612,7 +1643,8 @@ class App(ctk.CTk):
             with ThreadPoolExecutor(max_workers=1) as executor:
                 futures = {
                     executor.submit(_fetch_catmat_registros, cod,
-                                    d_ini, d_fim, salvar_corr, pasta_corr): cod
+                                    d_ini, d_fim, salvar_corr, pasta_corr,
+                                    self._pausar_por_conexao): cod
                     for cod in catmats_lista
                 }
                 for future in as_completed(futures):
@@ -1635,7 +1667,8 @@ class App(ctk.CTk):
                 with ThreadPoolExecutor(max_workers=1) as executor:
                     futures = {
                         executor.submit(_fetch_catmat_registros, cod,
-                                        d_ini, d_fim, salvar_corr, pasta_corr): cod
+                                        d_ini, d_fim, salvar_corr, pasta_corr,
+                                        self._pausar_por_conexao): cod
                         for cod in retry_list
                     }
                     for future in as_completed(futures):
@@ -1846,7 +1879,8 @@ class App(ctk.CTk):
         with ThreadPoolExecutor(max_workers=1) as executor:
             futures = {
                 executor.submit(_fetch_catmat_registros, cod,
-                                d_ini, d_fim, salvar_corr, pasta_corr): cod
+                                d_ini, d_fim, salvar_corr, pasta_corr,
+                                self._pausar_por_conexao): cod
                 for cod in codigos
             }
             for future in as_completed(futures):
@@ -1861,9 +1895,7 @@ class App(ctk.CTk):
                     comp = comp_count[0]
 
                 if tipo == "conexao":
-                    self._ui(lambda: messagebox.showerror("Conexão",
-                        "Erro de conexão com a API. Verifique sua rede."))
-                    self.processing = False; break
+                    pass  # já tratado dentro de _fetch_catmat_registros via pausa automática
 
                 elif tipo in ("erro", "vazio"):
                     txt = (f"ℹ️  {codigo}: sem registro (erro API)." if tipo == "erro"
