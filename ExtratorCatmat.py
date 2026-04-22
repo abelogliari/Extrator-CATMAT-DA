@@ -520,14 +520,53 @@ def processar_dataframe_final(df: pd.DataFrame, ordem_colunas: List[str]) -> pd.
                                               case=False, na=False)].copy()
     if df.empty: return df
 
+    # Mapa sigla → nome completo para preencher nomeUnidadeFornecimento ausente
+    _SIGLA_NOME = {
+        "FR-AM": "Frasco-Ampola", "FR": "Frasco", "CAPS": "Cápsula",
+        "COMPR": "Comprimido", "AM": "Ampola", "UN": "Unidade",
+        "SER": "Seringa", "BIS": "Bisnaga", "BLIS": "Blister",
+        "BOL": "Bolsa", "BOM": "Bombona", "CA": "Cartucho",
+        "CI": "Curie", "CJ": "Conjunto", "DOSE(S)": "Dose(s)",
+        "DOSES": "Dose(s)", "DRAG": "Drágea", "EMB": "Embalagem",
+        "EMP": "Emplastro", "ENV": "Envelope", "FLAC": "Flaconete",
+        "G": "Grama", "GL": "Galão", "GLOB": "Glóbulo",
+        "KG": "Quilograma", "L": "Litro", "MCG": "Micrograma",
+        "MCU": "Milicurie", "MG": "Miligrama",
+        "MIL CTE": "Milheiro de Cartelas", "ML": "Mililitro",
+        "PAST": "Pastilha", "POTE": "Pote", "RO": "Rolo",
+        "SAC": "Sachê", "SUP": "Supositório", "TAB": "Tablete",
+        "TBO": "Tubo", "TBTE": "Tubete", "UI": "Unid. Internacional",
+    }
+
+    def _val(row, col):
+        v = row.get(col)
+        s = str(v).strip() if pd.notna(v) else ""
+        return "" if s in ("", "nan", "None", "null") else s
+
     def uf(row):
-        # Usa as 4 colunas na ordem definida; inclui só as que têm valor
-        partes = []
-        for k in ["nomeUnidadeFornecimento", "siglaUnidadeFornecimento",
-                  "capacidadeUnidadeFornecimento", "siglaUnidadeMedida"]:
-            v = row.get(k)
-            if pd.notna(v) and str(v).strip() and str(v).strip() not in ("nan", "None"):
-                partes.append(str(v).strip())
+        nome  = _val(row, "nomeUnidadeFornecimento")
+        sigla = _val(row, "siglaUnidadeFornecimento")
+        cap   = _val(row, "capacidadeUnidadeFornecimento")
+        medi  = _val(row, "siglaUnidadeMedida")
+
+        # Se nomeUnidade vazio, tentar preencher pela sigla
+        if not nome and sigla:
+            nome = _SIGLA_NOME.get(sigla.upper(), sigla)
+
+        # capacidade: ignorar se for 0,00 ou 0.00 ou 0
+        try:
+            cap_num = float(cap.replace(".", "").replace(",", ".")) if cap else 0
+        except Exception:
+            cap_num = 0
+        cap_valida = bool(cap) and cap_num != 0
+
+        # Montar: Nome + capacidade + siglaUnidadeMedida
+        # Se não houver capacidade válida, ignorar também siglaUnidadeMedida
+        partes = [nome] if nome else []
+        if cap_valida:
+            partes.append(cap)
+            if medi:
+                partes.append(medi)
         return " ".join(partes)
 
     df["Unidade de Fornecimento"] = df.apply(uf, axis=1)
@@ -2442,14 +2481,53 @@ def processar_dataframe_final(df: pd.DataFrame, ordem_colunas: List[str]) -> pd.
                                               case=False, na=False)].copy()
     if df.empty: return df
 
+    # Mapa sigla → nome completo para preencher nomeUnidadeFornecimento ausente
+    _SIGLA_NOME = {
+        "FR-AM": "Frasco-Ampola", "FR": "Frasco", "CAPS": "Cápsula",
+        "COMPR": "Comprimido", "AM": "Ampola", "UN": "Unidade",
+        "SER": "Seringa", "BIS": "Bisnaga", "BLIS": "Blister",
+        "BOL": "Bolsa", "BOM": "Bombona", "CA": "Cartucho",
+        "CI": "Curie", "CJ": "Conjunto", "DOSE(S)": "Dose(s)",
+        "DOSES": "Dose(s)", "DRAG": "Drágea", "EMB": "Embalagem",
+        "EMP": "Emplastro", "ENV": "Envelope", "FLAC": "Flaconete",
+        "G": "Grama", "GL": "Galão", "GLOB": "Glóbulo",
+        "KG": "Quilograma", "L": "Litro", "MCG": "Micrograma",
+        "MCU": "Milicurie", "MG": "Miligrama",
+        "MIL CTE": "Milheiro de Cartelas", "ML": "Mililitro",
+        "PAST": "Pastilha", "POTE": "Pote", "RO": "Rolo",
+        "SAC": "Sachê", "SUP": "Supositório", "TAB": "Tablete",
+        "TBO": "Tubo", "TBTE": "Tubete", "UI": "Unid. Internacional",
+    }
+
+    def _val(row, col):
+        v = row.get(col)
+        s = str(v).strip() if pd.notna(v) else ""
+        return "" if s in ("", "nan", "None", "null") else s
+
     def uf(row):
-        # Usa as 4 colunas na ordem definida; inclui só as que têm valor
-        partes = []
-        for k in ["nomeUnidadeFornecimento", "siglaUnidadeFornecimento",
-                  "capacidadeUnidadeFornecimento", "siglaUnidadeMedida"]:
-            v = row.get(k)
-            if pd.notna(v) and str(v).strip() and str(v).strip() not in ("nan", "None"):
-                partes.append(str(v).strip())
+        nome  = _val(row, "nomeUnidadeFornecimento")
+        sigla = _val(row, "siglaUnidadeFornecimento")
+        cap   = _val(row, "capacidadeUnidadeFornecimento")
+        medi  = _val(row, "siglaUnidadeMedida")
+
+        # Se nomeUnidade vazio, tentar preencher pela sigla
+        if not nome and sigla:
+            nome = _SIGLA_NOME.get(sigla.upper(), sigla)
+
+        # capacidade: ignorar se for 0,00 ou 0.00 ou 0
+        try:
+            cap_num = float(cap.replace(".", "").replace(",", ".")) if cap else 0
+        except Exception:
+            cap_num = 0
+        cap_valida = bool(cap) and cap_num != 0
+
+        # Montar: Nome + capacidade + siglaUnidadeMedida
+        # Se não houver capacidade válida, ignorar também siglaUnidadeMedida
+        partes = [nome] if nome else []
+        if cap_valida:
+            partes.append(cap)
+            if medi:
+                partes.append(medi)
         return " ".join(partes)
 
     df["Unidade de Fornecimento"] = df.apply(uf, axis=1)
