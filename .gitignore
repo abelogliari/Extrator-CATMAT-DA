@@ -1,0 +1,9 @@
+# Pastas de dados (extrações e testes) — grandes demais para o repositório
+Extração 28_09/
+CSVs/
+teste/
+
+# Variáveis de ambiente locais e cache do Python
+.env
+__pycache__/
+.vscode

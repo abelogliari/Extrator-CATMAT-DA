@@ -12,6 +12,7 @@ consolidação DW + DA (aba 3) vivem todos aqui.
 
 import re
 import csv
+import codecs
 import requests
 import pandas as pd
 from io import StringIO
@@ -25,11 +26,13 @@ import unicodedata
 from datetime import date, datetime
 from pathlib import Path
 from openpyxl import Workbook, load_workbook
-from openpyxl.cell import WriteOnlyCell
 from openpyxl.styles import Alignment, Font, PatternFill
-from openpyxl.worksheet.worksheet import Worksheet
 import shutil
 import json
+import queue
+import xlsxwriter
+import multiprocessing
+from array import array
 import threading
 import math
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -71,6 +74,7 @@ pausar_busca_catmat = threading.Event()
 pausar_extracao.set()
 pausar_busca_catmat.set()
 cancelar_busca_catmat = False
+_lock_pausa_conexao = threading.Lock()   # várias threads podem detectar a queda juntas
 
 requests.packages.urllib3.disable_warnings(
     requests.packages.urllib3.exceptions.InsecureRequestWarning
@@ -90,6 +94,72 @@ _http.mount("http://",  _adapter)
 URL_BASE = "https://dadosabertos.compras.gov.br"
 TIMEOUT  = 120
 _MAX_PAGINAS = 20000   # trava contra laço infinito se a API paginar sem fim
+
+# =============================================================================
+# COTA DO COMPRAS.GOV
+# -----------------------------------------------------------------------------
+# O Compras.gov fica atrás de um Azure API Management que limita cada cliente a
+# ~100 requisições por MINUTO (medido em 29/09/2026: 97-100 passam, depois vem
+# 429 "Rate limit is exceeded. Try again in N seconds" com Retry-After de até
+# 45 s). A cota é UMA só para todos os módulos: pesquisa de preço e catálogo
+# (PDMs, itens) gastam do mesmo saldo. O BPS é outro servidor e fica de fora.
+#
+# Por isso a velocidade máxima é a cota, não o número de threads: todas as
+# chamadas ao Compras.gov passam por _get_compras, que espaça as saídas para
+# ficar logo abaixo do limite e, se ainda assim vier um 429, segura TODAS as
+# threads pelo tempo que o servidor pediu (Retry-After) e repete.
+# =============================================================================
+COTA_COMPRAS_POR_MINUTO = 90   # margem abaixo das ~100 medidas: um 429 custa até 45 s
+WORKERS_COMPRAS = 3            # 3 em paralelo cobrem a latência (~0,8 s) e enchem a cota
+
+
+class _CotaCompras:
+    """Espaçamento global das requisições + pausa global em caso de 429."""
+
+    def __init__(self, por_minuto):
+        self._intervalo = 60.0 / por_minuto
+        self._lock      = threading.Lock()
+        self._proximo   = 0.0          # instante mínimo da próxima saída
+        self._pausa_ate = 0.0          # 429: ninguém sai antes disto
+
+    def aguardar(self):
+        with self._lock:
+            saida = max(time.monotonic(), self._proximo, self._pausa_ate)
+            self._proximo = saida + self._intervalo
+        espera = saida - time.monotonic()
+        if espera > 0:
+            time.sleep(espera)
+
+    def bloquear(self, segundos):
+        with self._lock:
+            self._pausa_ate = max(self._pausa_ate, time.monotonic() + segundos)
+            self._proximo   = max(self._proximo, self._pausa_ate)
+
+
+_cota_compras = _CotaCompras(COTA_COMPRAS_POR_MINUTO)
+
+
+def _retry_after(resp) -> float:
+    """Segundos pedidos pelo servidor num 429 (+ meio segundo de folga)."""
+    try:
+        return float(resp.headers.get("Retry-After")) + 0.5
+    except (TypeError, ValueError):
+        m = re.search(r"(\d+)\s*second", resp.text or "")
+        return (int(m.group(1)) if m else 15) + 0.5
+
+
+def _get_compras(url, params, timeout=TIMEOUT, max_429=10):
+    """GET no Compras.gov respeitando a cota. Um 429 pausa todas as threads
+    pelo Retry-After e a chamada é repetida (até max_429 vezes). Erros de rede
+    sobem como exceção, como num _http.get comum."""
+    resp = None
+    for _ in range(max_429):
+        _cota_compras.aguardar()
+        resp = _http.get(url, params=params, timeout=timeout)
+        if resp.status_code != 429:
+            return resp
+        _cota_compras.bloquear(_retry_after(resp))
+    return resp
 
 # =============================================================================
 # TIPOS DE BUSCA  —  espelha o seletor "tipo" do endpoint de Pesquisa de Preço
@@ -118,6 +188,18 @@ ordem_final_colunas = [
 ]
 
 
+def _nome_da_parte(base_filename, ext_padrao, parte, simples=False):
+    """Nome do arquivo de cada parte.
+    simples=False -> base_part1.xlsx, base_part2.xlsx      (padrão do extrator)
+    simples=True  -> base.xlsx, base - Parte 2.xlsx        (arquivo por fonte)
+    """
+    base, ext = os.path.splitext(base_filename)
+    if not ext or ext.lower() != ext_padrao: ext = ext_padrao
+    if simples:
+        return f"{base}{ext}" if parte == 1 else f"{base} - Parte {parte}{ext}"
+    return f"{base}_part{parte}{ext}"
+
+
 class ExcelChunkWriter:
     """
     Escreve .xlsx em modo STREAMING (openpyxl write_only).
@@ -137,108 +219,133 @@ class ExcelChunkWriter:
     há como reescrever o arquivo periodicamente. A proteção contra queda no meio
     da execução passa a ser um espelho .parcial.csv, gravado em append (16 ms por
     página de 500 linhas) e apagado quando o .xlsx é fechado com sucesso.
+
+    Abas extras (ex.: "BPS") entram por write_dataframe(df, aba="BPS"): cada uma
+    tem cabeçalho, contagem e espelho próprios. Quando qualquer aba chega ao
+    limite, a pasta de trabalho inteira passa para a parte seguinte.
     """
 
     def __init__(self, base_filename, sheet_name="Dados CATMAT",
-                 max_rows_per_file=1_000_000, espelho=True):
+                 max_rows_per_file=1_000_000, espelho=True, nome_simples=False):
         self.base_filename = base_filename
         self.sheet_name    = sheet_name
         self.max_rows      = max_rows_per_file
+        self.nome_simples  = nome_simples   # ver _nome_da_parte
         self.part          = 1
-        self.header: List[str] = []
-        self.current_row_count = 0
         self.files_saved: List[str] = []
         self._finalizado   = False
         self._usar_espelho = espelho
-        self._espelho_f    = None
-        self._espelho_w    = None
+        # nome da aba -> {"header", "ws", "cab", "linhas", "esp_f", "esp_w"}
+        self._abas: dict   = {}
         self._new_workbook()
 
     def _filepath(self):
-        base, ext = os.path.splitext(self.base_filename)
-        if not ext or ext.lower() != ".xlsx": ext = ".xlsx"
-        return f"{base}_part{self.part}{ext}"
+        return _nome_da_parte(self.base_filename, ".xlsx", self.part, self.nome_simples)
 
-    def _espelho_path(self):
+    def _espelho_path(self, nome=None):
         base, _ = os.path.splitext(self.base_filename)
-        return f"{base}.parcial.csv"
+        if nome is None or nome == self.sheet_name:
+            return f"{base}.parcial.csv"
+        return f"{base}.{nome}.parcial.csv"
+
+    def _aba(self, nome):
+        a = self._abas.get(nome)
+        if a is None:
+            a = self._abas[nome] = {"header": [], "ws": None, "cab": False,
+                                    "linhas": 0, "esp_f": None, "esp_w": None}
+        return a
 
     def _new_workbook(self):
         # write_only exige create_sheet(); wb.active não existe nesse modo
         self.wb = Workbook(write_only=True)
-        self.ws = self.wb.create_sheet(self.sheet_name)
-        self.header_written = False; self.current_row_count = 0
+        for a in self._abas.values():
+            a["ws"] = None; a["cab"] = False; a["linhas"] = 0
+        self._ws(self.sheet_name)            # a aba principal é sempre a primeira
 
-    def _ensure_header(self, columns):
-        if not self.header: self.header = list(columns)
-        if not self.header_written:
-            self.ws.append(self.header); self.header_written = True
-            self._abrir_espelho()
+    def _ws(self, nome):
+        """Worksheet da aba na parte atual, criada (com cabeçalho) sob demanda."""
+        a = self._aba(nome)
+        if a["ws"] is None:
+            a["ws"] = self.wb.create_sheet(nome)
+        if not a["cab"] and a["header"]:
+            a["ws"].append(a["header"]); a["cab"] = True
+            self._abrir_espelho(nome)
+        return a["ws"]
 
-    def _abrir_espelho(self):
+    def _abrir_espelho(self, nome):
         """Espelho .parcial.csv — rede de segurança enquanto o .xlsx não fecha."""
-        if not self._usar_espelho or self._espelho_f is not None:
+        a = self._aba(nome)
+        if not self._usar_espelho or a["esp_f"] is not None:
             return
         try:
-            self._espelho_f = open(self._espelho_path(), "w",
-                                   encoding="utf-8-sig", newline="")
-            self._espelho_w = csv.writer(self._espelho_f, delimiter=";")
-            self._espelho_w.writerow(self.header)
+            a["esp_f"] = open(self._espelho_path(nome), "w",
+                              encoding="utf-8-sig", newline="")
+            a["esp_w"] = csv.writer(a["esp_f"], delimiter=";")
+            a["esp_w"].writerow(a["header"])
         except Exception:
             self._usar_espelho = False      # sem espelho é melhor que falhar
-            self._espelho_f = self._espelho_w = None
+            a["esp_f"] = a["esp_w"] = None
 
     def _fechar_espelho(self, apagar):
-        if self._espelho_f is None: return
-        try:
-            self._espelho_f.close()
-        except Exception:
-            pass
-        if apagar:
+        for nome, a in self._abas.items():
+            if a["esp_f"] is None: continue
             try:
-                os.remove(self._espelho_path())
+                a["esp_f"].close()
             except Exception:
                 pass
-        self._espelho_f = self._espelho_w = None
+            if apagar:
+                try:
+                    os.remove(self._espelho_path(nome))
+                except Exception:
+                    pass
+            a["esp_f"] = a["esp_w"] = None
 
-    def _rollover_if_needed(self):
-        if self.current_row_count + 1 > self.max_rows:
-            path = self._filepath(); self.wb.save(path); self.files_saved.append(path)
-            self.part += 1; self._new_workbook()
-            if self.header:
-                self.ws.append(self.header); self.header_written = True
+    def _rollover(self):
+        path = self._filepath(); self.wb.save(path); self.files_saved.append(path)
+        self.part += 1; self._new_workbook()
 
-    def write_dataframe(self, df: pd.DataFrame):
+    def write_dataframe(self, df: pd.DataFrame, aba: Optional[str] = None):
         if df is None or df.empty: return
-        self._ensure_header(list(df.columns))
-        faltantes = [c for c in self.header if c not in df.columns]
+        nome = aba or self.sheet_name
+        a = self._aba(nome)
+        if not a["header"]: a["header"] = list(df.columns)
+        faltantes = [c for c in a["header"] if c not in df.columns]
         if faltantes:
             df = df.copy()          # não mutar o DataFrame do chamador
             for col in faltantes: df[col] = pd.NA
-        df = df[self.header]
+        df = df[a["header"]]
         for linha in df.itertuples(index=False, name=None):
-            self._rollover_if_needed()
+            if a["linhas"] + 1 > self.max_rows:
+                self._rollover()
+            ws = self._ws(nome)
             # openpyxl levanta IllegalCharacterError em caracteres de controle,
             # frequentes no texto livre vindo da API — sanitiza na gravação
             limpa = [None if pd.isna(v) else
                      (_CTRL_ILEGAIS.sub(" ", v) if isinstance(v, str) else v)
                      for v in linha]
-            self.ws.append(limpa)
-            if self._espelho_w is not None:
-                self._espelho_w.writerow(["" if v is None else v for v in limpa])
-            self.current_row_count += 1
+            ws.append(limpa)
+            if a["esp_w"] is not None:
+                a["esp_w"].writerow(["" if v is None else v for v in limpa])
+            a["linhas"] += 1
+
+    def arquivos_extras(self) -> List[str]:
+        """Arquivos além dos principais — no Excel as abas extras ficam no mesmo arquivo."""
+        return []
 
     def flush(self, intervalo_min=30, fator=20):
         """
         Em write_only o .xlsx não pode ser reescrito no meio do caminho: o que se
-        garante aqui é que o espelho .parcial.csv esteja em disco.
+        garante aqui é que os espelhos .parcial.csv estejam em disco.
         """
-        if self._espelho_f is None: return None
-        try:
-            self._espelho_f.flush()
-        except Exception:
-            return None
-        return self._espelho_path()
+        for a in self._abas.values():
+            if a["esp_f"] is None: continue
+            try:
+                a["esp_f"].flush()
+            except Exception:
+                return None
+        principal = self._abas.get(self.sheet_name)
+        return (self._espelho_path() if principal and principal["esp_f"] is not None
+                else None)
 
     def _descartar_workbook(self):
         """
@@ -246,10 +353,12 @@ class ExcelChunkWriter:
         openpyxl abertos, e o lxml despeja 'Exception ignored ... LxmlSyntaxError'
         no stderr durante o garbage collector. close() encerra os streams.
         """
-        try:
-            self.ws.close()      # encerra os geradores de escrita da planilha
-        except Exception:
-            pass
+        for a in self._abas.values():
+            try:
+                if a["ws"] is not None:
+                    a["ws"].close()  # encerra os geradores de escrita da planilha
+            except Exception:
+                pass
         try:
             self.wb.close()
         except Exception:
@@ -260,7 +369,7 @@ class ExcelChunkWriter:
             return self.files_saved
         self._finalizado = True
         ok = True
-        if self.header_written and self.current_row_count > 0:
+        if any(a["linhas"] > 0 for a in self._abas.values()):
             path = self._filepath()
             try:
                 self.wb.save(path)
@@ -275,20 +384,32 @@ class ExcelChunkWriter:
 
 
 class CSVChunkWriter:
-    def __init__(self, base_filename, sep=";", encoding="utf-8-sig", max_rows_per_file=1_000_000):
+    def __init__(self, base_filename, sep=";", encoding="utf-8-sig", max_rows_per_file=1_000_000,
+                 nome_simples=False):
         self.base_filename = base_filename; self.sep = sep
         self.encoding = encoding; self.max_rows = max_rows_per_file
+        self.nome_simples = nome_simples    # ver _nome_da_parte
         self.part = 1; self.current_row_count = 0
         self.files_saved: List[str] = []; self.header_written = False
         self.header: List[str] = []
+        # CSV não tem abas: cada aba extra (ex.: "BPS") vira um arquivo à parte,
+        # base_BPS_part1.csv, com o seu próprio escritor
+        self._abas: dict = {}
 
     def _filepath(self):
-        base, ext = os.path.splitext(self.base_filename)
-        if not ext or ext.lower() != ".csv": ext = ".csv"
-        return f"{base}_part{self.part}{ext}"
+        return _nome_da_parte(self.base_filename, ".csv", self.part, self.nome_simples)
 
-    def write_dataframe(self, df: pd.DataFrame):
+    def write_dataframe(self, df: pd.DataFrame, aba: Optional[str] = None):
         if df is None or df.empty: return
+        if aba:
+            sub = self._abas.get(aba)
+            if sub is None:
+                base, ext = os.path.splitext(self.base_filename)
+                sub = self._abas[aba] = CSVChunkWriter(
+                    f"{base}_{aba}{ext or '.csv'}", sep=self.sep,
+                    encoding=self.encoding, max_rows_per_file=self.max_rows)
+            sub.write_dataframe(df)
+            return
         # O conjunto de colunas varia entre páginas (processar_dataframe_final
         # descarta colunas 100% vazias). Sem reindexar pelo cabeçalho da 1ª
         # página, o append gravaria valores sob colunas erradas.
@@ -308,8 +429,52 @@ class CSVChunkWriter:
         """CSV já é gravado em append a cada página — nada a fazer."""
         return None
 
+    def arquivos_extras(self) -> List[str]:
+        """Arquivos das abas extras (ex.: base_BPS_part1.csv)."""
+        return [p for sub in self._abas.values() for p in sub.files_saved]
+
     def finalize(self) -> List[str]:
-        return self.files_saved
+        return self.files_saved + self.arquivos_extras()
+
+
+class EscritorPorFonte:
+    """Um arquivo por fonte — "Classe 6505 - DA" e "Classe 6505 - BPS" — em
+    vez de uma pasta de trabalho com as abas Dados CATMAT e BPS.
+
+    Mesma interface dos outros writers: write_dataframe(df, aba=ABA_BPS) vai
+    para o arquivo do BPS, o resto para o do DA. Sem uma das fontes, o
+    arquivo dela simplesmente não existe (caminho None).
+    """
+
+    def __init__(self, caminho_da, caminho_bps, fmt):
+        def _novo(caminho, aba):
+            if caminho is None:
+                return None
+            if fmt == "csv":
+                return CSVChunkWriter(caminho, nome_simples=True)
+            return ExcelChunkWriter(caminho, sheet_name=aba, nome_simples=True)
+        self._da  = _novo(caminho_da, "Dados CATMAT")
+        self._bps = _novo(caminho_bps, ABA_BPS)
+
+    def write_dataframe(self, df: pd.DataFrame, aba: Optional[str] = None):
+        alvo = self._bps if (aba == ABA_BPS or self._da is None) else self._da
+        if alvo is not None:
+            alvo.write_dataframe(df)
+
+    def flush(self, intervalo_min=30, fator=20):
+        for w in (self._da, self._bps):
+            if w is not None:
+                w.flush(intervalo_min, fator)
+        return None
+
+    def arquivos_extras(self) -> List[str]:
+        """Os arquivos do BPS acompanham os do DA (ex.: no "salvar como")."""
+        if self._da is None or self._bps is None:
+            return []
+        return list(self._bps.files_saved)
+
+    def finalize(self) -> List[str]:
+        return [p for w in (self._da, self._bps) if w is not None for p in w.finalize()]
 
 
 def converter_data_para_api(data_dd_mm_yyyy: str) -> Optional[str]:
@@ -523,21 +688,18 @@ def ler_pagina_catmat(codigo, pagina, URL_BASE, TAMANHO_PAGINA, TIMEOUT,
 
     def _requisitar(params):
         """Retorna (csv_text, erro, status_http). csv_text=None quando falhou."""
-        tentativas = 0
-        while tentativas < 2:
-            try:
-                resp = _http.get(URL, params=params, timeout=TIMEOUT)
-                if resp.status_code == 429:
-                    time.sleep(15 if tentativas == 0 else 30); tentativas += 1; continue
-                if resp.status_code in (400, 404):
-                    return None, f"ERRO_REQUISICAO: HTTP {resp.status_code}", resp.status_code
-                resp.raise_for_status()
-                return resp.content.decode("utf-8-sig", errors="replace"), None, 200
-            except requests.exceptions.ConnectionError as e:
-                return None, f"ERRO_CONEXAO: {e}", None
-            except requests.exceptions.RequestException as e:
-                return None, f"ERRO_REQUISICAO: {e}", None
-        return None, f"ERRO_REQUISICAO: 429 persistente para {tipo} {codigo}", 429
+        try:
+            resp = _get_compras(URL, params)       # 429 já tratado pela cota
+            if resp.status_code == 429:
+                return None, f"ERRO_REQUISICAO: 429 persistente para {tipo} {codigo}", 429
+            if resp.status_code in (400, 404):
+                return None, f"ERRO_REQUISICAO: HTTP {resp.status_code}", resp.status_code
+            resp.raise_for_status()
+            return resp.content.decode("utf-8-sig", errors="replace"), None, 200
+        except requests.exceptions.ConnectionError as e:
+            return None, f"ERRO_CONEXAO: {e}", None
+        except requests.exceptions.RequestException as e:
+            return None, f"ERRO_REQUISICAO: {e}", None
 
     # ── 1ª opção: assinatura nova (tipo + codigo) ────────────────────────────
     if _API_ACEITA_TIPO is not False:
@@ -583,18 +745,11 @@ def buscar_pdms_por_classe(codigo_classe: int, URL_BASE: str, TIMEOUT: int,
         data      = None
         while tentativa < max_tentativas and not sucesso:
             try:
-                resp = _http.get(URL, params={
+                # 429 é tratado pela cota (_get_compras): espera o Retry-After
+                resp = _get_compras(URL, params={
                     "codigoClasse": codigo_classe, "pagina": pagina_atual,
                     "tamanhoPagina": TAMANHO_PAGINA, "bps": "false"
                 }, timeout=TIMEOUT)
-                # Rate-limit: espera antes de tentar de novo
-                if resp.status_code == 429:
-                    espera = 15 * (tentativa + 1)
-                    print(f"Rate-limit classe {codigo_classe} pág {pagina_atual} "
-                          f"— aguardando {espera}s (tentativa {tentativa+1})")
-                    time.sleep(espera)
-                    tentativa += 1
-                    continue
                 resp.raise_for_status()
                 data    = resp.json()
                 sucesso = True
@@ -624,8 +779,7 @@ def buscar_pdms_por_classe(codigo_classe: int, URL_BASE: str, TIMEOUT: int,
                              if total_registros_api > 0 else 1)
             print(f"Classe {codigo_classe}: {total_registros_api} PDMs / "
                   f"{total_paginas} página(s)")
-        pagina_atual += 1
-        time.sleep(0.2)
+        pagina_atual += 1       # o ritmo entre páginas é dado pela cota
 
     if not all_pdms: return None
 
@@ -655,7 +809,7 @@ def buscar_catmats_por_pdm(codigos_pdm, URL_BASE, TIMEOUT, app,
                            log_fn=None, max_workers=5):
     """
     Busca CATMATs de múltiplos PDMs em paralelo usando ThreadPoolExecutor.
-    max_workers=5 → ~5x mais rápido sem sobrecarregar a API.
+    As threads cobrem a latência; o ritmo real é o da cota (_get_compras).
     """
     global cancelar_busca_catmat
     URL   = f"{URL_BASE}/modulo-material/4_consultarItemMaterial"
@@ -674,12 +828,12 @@ def buscar_catmats_por_pdm(codigos_pdm, URL_BASE, TIMEOUT, app,
         try:
             while pagina_atual <= total_paginas:
                 if cancelar_busca_catmat: break
-                resp = _http.get(URL, params={
+                # 429 é tratado pela cota; se persistir, raise_for_status
+                # marca o PDM como erro e ele entra na próxima tentativa
+                resp = _get_compras(URL, params={
                     "codigoPdm": pdm_code, "pagina": pagina_atual,
                     "tamanhoPagina": 500, "bps": "false"
                 }, timeout=TIMEOUT)
-                if resp.status_code == 429:
-                    time.sleep(15); continue          # rate-limit: aguarda e repete
                 resp.raise_for_status()
                 data = resp.json()
                 if "resultado" in data:
@@ -687,8 +841,6 @@ def buscar_catmats_por_pdm(codigos_pdm, URL_BASE, TIMEOUT, app,
                 if pagina_atual == 1:
                     total_paginas = data.get("totalPaginas", 1)
                 pagina_atual += 1
-                if pagina_atual <= total_paginas:
-                    time.sleep(0.2)                   # throttle entre páginas do mesmo PDM
         except Exception:
             with lock:
                 pdms_com_erro.append(pdm_code)
@@ -839,7 +991,7 @@ def _fetch_catmat_registros(codigo, d_ini, d_fim, salvar_corr, pasta_corr,
                 break
             if pagina_atual > _MAX_PAGINAS:      # trava de segurança
                 break
-            time.sleep(0.5)
+            # Sem pausa fixa entre páginas: o ritmo é o da cota (_get_compras)
             _, csv_text = ler_pagina_catmat(codigo, pagina_atual, URL_BASE,
                                             TAMANHO_PAGINA, TIMEOUT,
                                             d_ini, d_fim, tipo=tipo)
@@ -850,6 +1002,291 @@ def _fetch_catmat_registros(codigo, d_ini, d_fim, salvar_corr, pasta_corr,
 
     except Exception:
         return codigo, [], "erro", 0, {}
+
+
+# =============================================================================
+# BPS — BANCO DE PREÇOS EM SAÚDE (API de Dados Abertos do Ministério da Saúde)
+# -----------------------------------------------------------------------------
+# GET /economia-da-saude/bps?codigoCatmat=...&dataCompraInicio=...&pagina=...
+# Traz os mesmos registros da extração SQL do dbbps (extracao_bps.sql). A API
+# não informa o total de registros: a paginação segue até vir uma página
+# incompleta. Também não filtra por PDM, então um PDM é expandido nos seus
+# CATMATs pelo catálogo do Compras.gov antes da consulta.
+# =============================================================================
+
+URL_BPS = "https://apidadosabertos.saude.gov.br/economia-da-saude/bps"
+TAMANHO_PAGINA_BPS = 500           # máximo aceito pela API
+ABA_BPS = "BPS"
+# Cabeçalho da aba BPS: os campos da API, com os nomes da API, na ORDEM das
+# colunas do extracao_bps.sql (à direita, a coluna equivalente do SQL).
+COLUNAS_BPS = [
+    "codigoCatmat",             # codigoBR
+    "descricaoItem",            # descricaoCATMAT
+    "unidadeFornecimento",      # unidadeFornecimento
+    "capacidade",               # capacidade (a API entrega x100: 25000.0 = 250,00)
+    "siglaUnidadeMedida",       # unidadeMedida
+    "unidadeMedidaCapacidade",  # unidadeFornecimentoCapacidade
+    "codigoClasse",             # codigoClasse
+    "nomeClasse",               # descricaoClasse
+    "codigoPdm",                # pdm
+    "nomePdm",                  # descricaoPDM
+    "registroAnvisa",           # anvisa
+    "generico",                 # generico
+    "anoCompra",                # anoCompra
+    "dataCompra",               # compra
+    "dataInsercao",             # insercao
+    "modalidade",               # modalidadeCompra
+    "tipoCompra",               # tipoCompra
+    "nomeInstituicao",          # nomeInstituicao
+    "cnpjInstituicao",          # cnpjInstituicao
+    "municipio",                # municipioInstituicao
+    "estado",                   # uf
+    "esfera",                   # esfera
+    "cnpjFornecedor",           # cnpjFornecedor
+    "nomeFornecedor",           # fornecedor
+    "cnpjFabricante",           # cnpjFabricante
+    "nomeFabricante",           # fabricante
+    "quantidade",               # qtdItensComprados
+    "precoUnitario",            # precoUnitario
+    "precoTotal",               # precoTotal
+    "numeroProcessoCompra",     # numeroProcesso
+    "numeroAta",                # numeroAtaPrecos
+    "validadeCompra",           # validadeCompra
+    "observacoes",              # observacoes
+    # No SQL as colunas de grupo ficam comentadas no fim (fora da exportação);
+    # aqui vêm depois das 33, sem mexer na posição das demais.
+    "codigoGrupo",              # codigoGrupo
+    "nomeGrupo",                # descricaoGrupo
+]
+
+# A consulta ao BPS roda em paralelo com a do Compras.gov (servidores
+# diferentes), então não soma tempo à extração. "orq" coordena um código por
+# vez; o outro pool faz as chamadas de cada CATMAT (um PDM tem dezenas).
+_pool_bps_orq = ThreadPoolExecutor(max_workers=2, thread_name_prefix="bps-orq")
+_pool_bps     = ThreadPoolExecutor(max_workers=4, thread_name_prefix="bps")
+# Descrição do BPS por CATMAT ("" = CATMAT sem nenhuma compra no BPS).
+# Zerado no início de cada extração.
+_cache_desc_bps: dict = {}
+_cache_desc_lock = threading.Lock()
+
+# ── Limpeza da descrição: ESPELHO do bloco ds_catmat do extracao_bps.sql ────
+# Mesmas regras, na mesma ordem, para que a descrição que o extrator grava
+# seja idêntica à da extração SQL. Mudou uma regra lá? Mude aqui também.
+_TAGS_BPS = re.compile(r"</?(div|span|p|br|b|i|strong|em)[^>]*>", re.IGNORECASE)
+_ENTIDADES_BPS = (
+    ("&#193;", "Á"), ("&#194;", "Â"), ("&#195;", "Ã"), ("&#199;", "Ç"),
+    ("&#201;", "É"), ("&#202;", "Ê"), ("&#205;", "Í"), ("&#211;", "Ó"),
+    ("&#212;", "Ô"), ("&#213;", "Õ"), ("&#218;", "Ú"), ("&#220;", "Ü"),
+    ("&#225;", "á"), ("&#226;", "â"), ("&#227;", "ã"), ("&#231;", "ç"),
+    ("&#233;", "é"), ("&#234;", "ê"), ("&#237;", "í"), ("&#243;", "ó"),
+    ("&#244;", "ô"), ("&#245;", "õ"), ("&#250;", "ú"), ("&#252;", "ü"),
+    ("&#186;", "º"), ("&#170;", "ª"),
+)
+_ESP = r"[ \t\n\r\f\v]"            # o [[:space:]] do PostgreSQL
+_RE_DOIS_PONTOS_BPS = re.compile(_ESP + r"*:" + _ESP + r"*")
+_RE_ESP_VIRGULA_BPS = re.compile(_ESP + r"+,")
+_RE_ESPACOS_BPS     = re.compile(_ESP + r"+")
+
+
+def limpar_descricao_bps(texto) -> str:
+    """Descrição do BPS limpa exatamente como o extracao_bps.sql limpa."""
+    if not texto:
+        return ""
+    s = _TAGS_BPS.sub("", str(texto))
+    for entidade, caractere in _ENTIDADES_BPS:
+        s = s.replace(entidade, caractere)
+    s = s.replace("¿", "°").replace("*", "")
+    s = _RE_DOIS_PONTOS_BPS.sub(": ", s)
+    s = _RE_ESP_VIRGULA_BPS.sub(",", s)
+    s = _RE_ESPACOS_BPS.sub(" ", s)
+    return s.strip(" ")
+
+
+def _cod_bps(valor) -> str:
+    """CATMAT como chave: só dígitos, sem zeros à esquerda."""
+    s = str(valor if valor is not None else "").strip()
+    return (s.lstrip("0") or "0") if s.isdigit() else ""
+
+
+def _get_bps(params, cancelado=None, tentativas=4):
+    """Uma página da API do BPS. Devolve (lista, erro); lista=None se falhou."""
+    ultimo = ""
+    for t in range(tentativas):
+        pausar_extracao.wait()
+        if cancelado and cancelado():
+            return None, "cancelado"
+        try:
+            r = _http.get(URL_BPS, params=params, timeout=TIMEOUT)
+            if r.status_code == 429 or r.status_code >= 500:
+                ultimo = f"HTTP {r.status_code}"
+                time.sleep(15 * (t + 1) if r.status_code == 429 else 3 * (t + 1))
+                continue
+            r.raise_for_status()
+            return r.json().get("bps") or [], None
+        except (requests.exceptions.RequestException, ValueError) as e:
+            ultimo = f"{type(e).__name__}: {e}"
+            time.sleep(3 * (t + 1))
+    return None, ultimo
+
+
+def buscar_bps_catmat(codigo, d_ini=None, d_fim=None, cancelado=None):
+    """Todos os registros do BPS de um CATMAT no período. Devolve (lista, erro)."""
+    base = {"codigoCatmat": _cod_bps(codigo), "tamanhoPagina": TAMANHO_PAGINA_BPS}
+    if d_ini: base["dataCompraInicio"] = d_ini
+    if d_fim: base["dataCompraFim"]    = d_fim
+    registros = []
+    for pagina in range(1, _MAX_PAGINAS + 1):
+        lote, erro = _get_bps(dict(base, pagina=pagina), cancelado)
+        if lote is None:
+            return None, erro
+        registros.extend(lote)
+        if len(lote) < TAMANHO_PAGINA_BPS:
+            break
+    return registros, None
+
+
+def _descricao_bps_sem_periodo(codigo, cancelado=None):
+    """Descrição de um CATMAT que não teve compra no BPS dentro do período:
+    basta um registro de qualquer data. None = falha; "" = nunca comprado."""
+    lote, _ = _get_bps({"codigoCatmat": _cod_bps(codigo), "pagina": 1,
+                        "tamanhoPagina": 1}, cancelado)
+    if lote is None:
+        return None
+    return limpar_descricao_bps(lote[0].get("descricaoItem")) if lote else ""
+
+
+def catmats_do_pdm(pdm, tentativas=3):
+    """CATMATs de um PDM no catálogo do Compras.gov. None se a API falhar."""
+    URL = f"{URL_BASE}/modulo-material/4_consultarItemMaterial"
+    codigos, pagina, total_paginas = [], 1, 1
+    while pagina <= total_paginas:
+        for t in range(tentativas):
+            try:
+                # gasta da mesma cota da pesquisa de preço (429 tratado lá)
+                resp = _get_compras(URL, params={"codigoPdm": int(pdm), "pagina": pagina,
+                                                 "tamanhoPagina": 500, "bps": "false"})
+                resp.raise_for_status()
+                data = resp.json()
+                break
+            except (requests.exceptions.RequestException, ValueError):
+                time.sleep(3 * (t + 1))
+        else:
+            return None
+        codigos += [_cod_bps(i.get("codigoItem")) for i in data.get("resultado", [])]
+        if pagina == 1:
+            total_paginas = int(data.get("totalPaginas") or 1)
+        pagina += 1
+    return [c for c in dict.fromkeys(codigos) if c]
+
+
+def _bps_do_codigo(codigo, tipo, d_ini, d_fim, cancelado=None) -> dict:
+    """Registros do BPS de um código da extração: o próprio CATMAT, ou todos
+    os CATMATs de um PDM. A descrição já sai limpa (limpar_descricao_bps).
+
+    Devolve {"df": DataFrame|None, "desc": {catmat: descrição},
+             "falhas": [catmats que não responderam], "trocadas": 0}
+    """
+    res = {"df": None, "desc": {}, "falhas": [], "trocadas": 0}
+    if tipo == TIPO_PDM:
+        catmats = catmats_do_pdm(codigo)
+        if catmats is None:
+            res["falhas"].append(f"PDM {codigo} (lista de CATMATs)")
+            return res
+    else:
+        catmats = [_cod_bps(codigo)]
+    futuros = [(c, _pool_bps.submit(buscar_bps_catmat, c, d_ini, d_fim, cancelado))
+               for c in catmats if c]
+    registros = []
+    for c, fut in futuros:                  # na ordem dos CATMATs, não de chegada
+        lote, _erro = fut.result()
+        if lote is None:
+            res["falhas"].append(c)
+            continue
+        for r in lote:
+            r["descricaoItem"] = limpar_descricao_bps(r.get("descricaoItem"))
+            if r["descricaoItem"]:
+                res["desc"].setdefault(_cod_bps(r.get("codigoCatmat")), r["descricaoItem"])
+        registros.extend(lote)
+    if registros:
+        extras = [k for k in registros[0] if k not in COLUNAS_BPS]
+        res["df"] = pd.DataFrame(registros).reindex(columns=COLUNAS_BPS + extras)
+    with _cache_desc_lock:
+        _cache_desc_bps.update(res["desc"])
+    return res
+
+
+def _aplicar_descricao_bps(dfs_e_meta, bps: dict, cancelado=None):
+    """Troca o descricaoItem do Compras.gov pela descrição do BPS do mesmo
+    CATMAT. CATMAT sem compra no BPS no período ganha uma consulta sem data;
+    sem nenhuma compra no BPS, fica o texto do Compras.gov."""
+    usados = set()
+    for df, _m, _p in dfs_e_meta:
+        if "codigoItemCatalogo" in df.columns:
+            usados.update(_cod_bps(c) for c in df["codigoItemCatalogo"])
+    usados.discard("")
+    with _cache_desc_lock:
+        faltam = [c for c in usados
+                  if c not in bps["desc"] and c not in _cache_desc_bps]
+    futuros = [(c, _pool_bps.submit(_descricao_bps_sem_periodo, c, cancelado))
+               for c in faltam]
+    for c, fut in futuros:
+        desc = fut.result()
+        if desc is not None:                # falha não entra no cache: tenta de novo depois
+            with _cache_desc_lock:
+                _cache_desc_bps[c] = desc
+    with _cache_desc_lock:
+        mapa = {c: _cache_desc_bps.get(c, "") for c in usados}
+    mapa.update(bps["desc"])
+    mapa = {c: d for c, d in mapa.items() if d}
+    if not mapa:
+        return
+    for df, _m, _p in dfs_e_meta:
+        if "codigoItemCatalogo" not in df.columns or "descricaoItem" not in df.columns:
+            continue
+        novo = df["codigoItemCatalogo"].map(_cod_bps).map(mapa)
+        trocar = novo.notna() & (novo != df["descricaoItem"])
+        if trocar.any():
+            df.loc[trocar, "descricaoItem"] = novo[trocar]
+            bps["trocadas"] += int(trocar.sum())
+
+
+def _fetch_codigo(codigo, d_ini, d_fim, salvar_corr, pasta_corr,
+                  _pausar_conexao_fn=None, tipo=TIPO_CATMAT,
+                  _cancelado_fn=None, bps_cfg=None):
+    """Compras.gov e/ou BPS do mesmo código, conforme as fontes escolhidas.
+
+    Devolve a 5-tupla de _fetch_catmat_registros + o resultado do BPS (dict
+    de _bps_do_codigo, ou None quando o BPS não foi consultado). Sem o
+    Compras.gov, a 5-tupla vem com o status "pulado".
+    bps_cfg: None (só Compras.gov) | {"compras", "aba", "descricao"} — ver
+    App._config_bps. Com descricao=True e sem a fonte BPS, só a descrição de
+    cada CATMAT é consultada (uma chamada leve por CATMAT).
+    """
+    cfg = bps_cfg or {"compras": True, "aba": False, "descricao": False}
+    fut = (_pool_bps_orq.submit(_bps_do_codigo, codigo, tipo, d_ini, d_fim,
+                                _cancelado_fn) if cfg["aba"] else None)
+    if cfg["compras"]:
+        res = _fetch_catmat_registros(codigo, d_ini, d_fim, salvar_corr, pasta_corr,
+                                      _pausar_conexao_fn, tipo, _cancelado_fn)
+    else:
+        res = (codigo, [], "pulado", 0, {})
+    bps = None
+    if fut is not None:
+        try:
+            bps = fut.result()
+        except Exception as e:              # BPS nunca derruba a extração do Compras.gov
+            bps = {"df": None, "desc": {}, "falhas": [f"{codigo} ({type(e).__name__})"],
+                   "trocadas": 0}
+    elif cfg["descricao"]:
+        bps = {"df": None, "desc": {}, "falhas": [], "trocadas": 0}
+    if bps is None:
+        return res + (None,)
+    if cfg["descricao"] and res[2] == "ok":
+        try:
+            _aplicar_descricao_bps(res[1], bps, _cancelado_fn)
+        except Exception:
+            pass
+    return res + (bps,)
 
 
 def processar_dataframe_final(df: pd.DataFrame, ordem_colunas: List[str]) -> pd.DataFrame:
@@ -951,6 +1388,18 @@ Este programa possui tres funcoes principais em abas separadas:
      busca todas as informacoes de compras, corrige problemas nos dados e
      consolida tudo em um arquivo Excel ou CSV.
 
+     Em "Fontes" (vale tambem para a aba 2) escolha de onde extrair:
+       Compras.gov + BPS -> planilha com as abas Dados CATMAT e BPS (no
+                            CSV, um arquivo _BPS ao lado do principal)
+       so Compras.gov    -> como antes, so a aba Dados CATMAT
+       so BPS            -> arquivo ..._BPS com os registros do Banco de
+                            Precos em Saude (API de Dados Abertos da Saude)
+     Com "Usar a descricao do BPS", o descricaoItem do Compras.gov passa a
+     ser o texto do BPS do mesmo CATMAT. As colunas do BPS seguem a ordem
+     do extracao_bps.sql. Com "Salvar um arquivo por fonte", cada classe
+     gera "Classe 6505 - DA" e "Classe 6505 - BPS" em vez de uma pasta de
+     trabalho com as duas abas.
+
   2. Extracao por Classes (aba ao lado)
      Se voce quer descobrir novos itens, pode comecar com o codigo de uma
      ou mais Classes, encontrar todos os Padroes Descritivos de Materiais
@@ -1009,6 +1458,14 @@ Se a chave do DA existir no DW, a linha do DA sai: o DW e a fonte
 preferencial, por trazer mais informacao.
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Descricao do item
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+A coluna "Descricao" do DW recebe o descritivo que o DA usa para o mesmo
+CATMAT, para as duas abas falarem a mesma lingua. CATMAT do DW que nao
+aparece em nenhum arquivo do DA mantem a descricao do proprio DW.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 Como usar
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
@@ -1017,6 +1474,13 @@ Como usar
      use DW ou DA para forcar a classificacao.
   2. Escolha a pasta de saida.
   3. Clique em "Consolidar e Remover Duplicatas".
+
+Cada classe vira uma pasta de trabalho com as abas DW e DA. Se uma delas
+passar do limite de 1.048.576 linhas do Excel, o excedente vai para
+"... - Parte 2", cortando em fronteira de ano.
+
+"Processos" divide a gravacao entre nucleos do computador - uma classe por
+processo. Comece com 1 e va aumentando: o ganho depende da maquina.
 
 Alem das planilhas por classe, sao gerados o Relatorio_Consolidacao.xlsx
 (contagens por classe) e, quando houver, o linhas_em_quarentena.csv com as
@@ -1249,6 +1713,23 @@ class App(ctk.CTk):
                                fg_color=C_ACCENT, border_color=C_BORDER)\
                 .pack(side="left", padx=(0,16))
 
+        # Fontes — valem para as extrações das abas 1 e 2 (como o formato)
+        _lbl(r3, "Fontes:", color=C_TEXT_MED).pack(side="left", padx=(12,10))
+        self.var_fonte_compras = tk.BooleanVar(value=True)
+        self.var_fonte_bps     = tk.BooleanVar(value=True)
+        for txt, var in (("Compras.gov", self.var_fonte_compras),
+                         ("BPS", self.var_fonte_bps)):
+            ctk.CTkCheckBox(r3, text=txt, variable=var, command=self._toggle_bps,
+                            font=("Segoe UI",12), text_color=C_TEXT,
+                            fg_color=C_GREEN, border_color=C_BORDER)\
+                .pack(side="left", padx=(0,12))
+        self.var_desc_bps = tk.BooleanVar(value=True)
+        self.chk_desc_bps = ctk.CTkCheckBox(
+            r3, text="Usar a descrição do BPS", variable=self.var_desc_bps,
+            font=("Segoe UI",12), text_color=C_TEXT,
+            fg_color=C_GREEN, border_color=C_BORDER)
+        self.chk_desc_bps.pack(side="left", padx=(8,0))
+
         _sep(inn)
 
         # corrompidos
@@ -1259,6 +1740,16 @@ class App(ctk.CTk):
                         font=("Segoe UI",12), text_color=C_TEXT,
                         fg_color=C_ACCENT, border_color=C_BORDER)\
             .pack(side="left")
+        # Vale para as abas 1 e 2: "Classe 6505 - DA" + "Classe 6505 - BPS"
+        # em vez de uma pasta de trabalho com as duas abas
+        self.var_por_fonte = tk.BooleanVar(value=False)
+        ctk.CTkCheckBox(r4, text="Salvar um arquivo por fonte",
+                        variable=self.var_por_fonte,
+                        font=("Segoe UI",12), text_color=C_TEXT,
+                        fg_color=C_ACCENT, border_color=C_BORDER)\
+            .pack(side="left", padx=(24,0))
+        _lbl(r4, "  (ex.: \"Classe 6505 - DA\" e \"Classe 6505 - BPS\")",
+             size=10, color=C_TEXT_LIGHT).pack(side="left")
         self.frame_pasta = ctk.CTkFrame(inn, fg_color="transparent")
         rp = ctk.CTkFrame(self.frame_pasta, fg_color="transparent")
         rp.pack(fill="x", pady=3)
@@ -1580,7 +2071,7 @@ class App(ctk.CTk):
 
         ro = ctk.CTkFrame(inn2, fg_color="transparent"); ro.pack(fill="x", pady=3)
         _lbl(ro, "Prefixo:", color=C_TEXT_MED).pack(side="left", padx=(0,6))
-        self.var_cons_prefixo = tk.StringVar(value="bps_dw_da__Classe_")
+        self.var_cons_prefixo = tk.StringVar(value="DA-DW Classe ")
         _entry(ro, textvariable=self.var_cons_prefixo, width=180).pack(side="left")
         _lbl(ro, "Sufixo:", color=C_TEXT_MED).pack(side="left", padx=(14,6))
         self.var_cons_sufixo = tk.StringVar()
@@ -1596,18 +2087,33 @@ class App(ctk.CTk):
                width=70).pack(side="left")
 
         rc = ctk.CTkFrame(inn2, fg_color="transparent"); rc.pack(fill="x", pady=3)
+        _lbl(rc, "Processos:", color=C_TEXT_MED).pack(side="left", padx=(0,6))
+        # Um processo por classe divide a gravação, que é onde está ~92% do
+        # tempo. Padrão 1 (sequencial): o paralelo é opt-in até você validar.
+        try:
+            nucleos = os.cpu_count() or 1
+        except Exception:
+            nucleos = 1
+        opcoes = [str(n) for n in (1, 2, 3, 4, 6, 8) if n <= max(1, nucleos)] or ["1"]
+        self.var_cons_processos = tk.StringVar(value="1")
+        ctk.CTkOptionMenu(rc, values=opcoes, variable=self.var_cons_processos,
+                          font=("Segoe UI",12), width=62, height=28,
+                          corner_radius=6, fg_color=C_SURFACE,
+                          button_color=C_BORDER, button_hover_color=C_ACCENT,
+                          text_color=C_TEXT,
+                          dropdown_font=("Segoe UI",12)).pack(side="left", padx=(0,18))
         self.var_cons_dup = tk.BooleanVar(value=True)
-        ctk.CTkCheckBox(rc, text="Gerar CSV de auditoria com as duplicatas removidas",
+        ctk.CTkCheckBox(rc, text="Gerar CSV de auditoria das duplicatas",
                         variable=self.var_cons_dup, font=("Segoe UI",12),
                         text_color=C_TEXT, fg_color=C_ACCENT,
-                        border_color=C_BORDER).pack(side="left", padx=(0,20))
+                        border_color=C_BORDER).pack(side="left", padx=(0,18))
         self.var_cons_dedup_interno = tk.BooleanVar(value=False)
-        ctk.CTkCheckBox(rc, text="Também remover repetições internas do DA",
+        ctk.CTkCheckBox(rc, text="Remover repetições internas do DA",
                         variable=self.var_cons_dedup_interno, font=("Segoe UI",12),
                         text_color=C_TEXT, fg_color=C_ACCENT,
                         border_color=C_BORDER).pack(side="left")
-        _lbl(rc, "  (atenção: costumam ser registros distintos, com fornecedor "
-                 "e preço diferentes)", size=10, color=C_TEXT_LIGHT).pack(side="left")
+        _lbl(rc, "  (costumam ser registros distintos)", size=10,
+             color=C_TEXT_LIGHT).pack(side="left")
 
         # ── Resumo ───────────────────────────────────────────────────────────
         grid = ctk.CTkFrame(parent, fg_color=C_BG)
@@ -1713,6 +2219,74 @@ class App(ctk.CTk):
         else:
             self.frame_pasta.pack_forget()
 
+    def _toggle_bps(self):
+        # A descrição do BPS entra no descricaoItem do Compras.gov: sem o
+        # Compras.gov não há o que trocar. Sem a fonte BPS ela continua
+        # possível — vem de uma consulta leve, só da descrição.
+        self.chk_desc_bps.configure(
+            state="normal" if self.var_fonte_compras.get() else "disabled")
+
+    def _fontes_ok(self) -> bool:
+        if self.var_fonte_compras.get() or self.var_fonte_bps.get():
+            return True
+        messagebox.showerror("Nenhuma fonte",
+            "Marque ao menos uma fonte: Compras.gov, BPS ou as duas.")
+        return False
+
+    def _config_bps(self):
+        """Fontes lidas na thread principal (Tk não é thread-safe).
+            compras   -> extrai do Compras.gov
+            aba       -> extrai do BPS (aba BPS; no modo só BPS, a aba principal)
+            descricao -> troca o descricaoItem do Compras.gov pelo texto do BPS
+        Também zera o cache de descrições, que vale só para uma extração."""
+        with _cache_desc_lock:
+            _cache_desc_bps.clear()
+        self._por_fonte = bool(self.var_por_fonte.get())   # lido por _novo_writer
+        compras = bool(self.var_fonte_compras.get())
+        return {"compras": compras, "aba": bool(self.var_fonte_bps.get()),
+                "descricao": compras and bool(self.var_desc_bps.get())}
+
+    def _log_config_bps(self, cfg):
+        fontes = " + ".join(n for n, on in (("Compras.gov", cfg["compras"]),
+                                            ("BPS", cfg["aba"])) if on)
+        txt = f"🧭 Fontes: {fontes}"
+        if cfg["compras"]:
+            txt += (" | descrição do BPS no descricaoItem: "
+                    + ("sim" if cfg["descricao"] else "não"))
+        if getattr(self, "_por_fonte", False):
+            txt += " | um arquivo por fonte"
+        self._log(txt, "info")
+
+    def _novo_writer(self, pasta, fmt, classe=None):
+        """Writer da extração de uma classe (ou do arquivo único, classe=None).
+
+        Um arquivo por fonte  -> "Classe 6505 - DA" e "Classe 6505 - BPS"
+        Compras.gov (+ BPS)   -> classe_6505_part1, com a aba BPS dentro
+        Só BPS                -> classe_6505_BPS_part1, com a aba BPS só
+                                 (sem uma aba Dados CATMAT vazia)
+        """
+        cfg = getattr(self, "_bps_cfg", None) or {"compras": True, "aba": False}
+        ext = "csv" if fmt == "csv" else "xlsx"
+        no_destino = lambda nome: os.path.join(pasta, nome) if pasta else nome
+        if getattr(self, "_por_fonte", False):
+            rotulo = f"Classe {classe}" if classe else "dados_completos_extraidos"
+            return EscritorPorFonte(
+                no_destino(f"{rotulo} - DA.{ext}") if cfg["compras"] else None,
+                no_destino(f"{rotulo} - {ABA_BPS}.{ext}") if cfg["aba"] else None,
+                fmt)
+        base = f"classe_{classe}" if classe else "dados_completos_extraidos"
+        if not cfg["compras"]:
+            caminho = no_destino(f"{base}_{ABA_BPS}.{ext}")
+            return (CSVChunkWriter(caminho) if fmt == "csv"
+                    else ExcelChunkWriter(caminho, sheet_name=ABA_BPS))
+        caminho = no_destino(f"{base}.{ext}")
+        return CSVChunkWriter(caminho) if fmt == "csv" else ExcelChunkWriter(caminho)
+
+    @staticmethod
+    def _aba_bps(cfg):
+        """Onde gravar as linhas do BPS: aba própria, ou a principal no modo só BPS."""
+        return ABA_BPS if cfg["compras"] else None
+
     def _toggle_pasta_classe1(self):
         """Mostra o campo de pasta apenas quando o modo por classe está ativo."""
         if self.var_por_classe1.get():
@@ -1741,6 +2315,7 @@ class App(ctk.CTk):
         return TIPO_POR_ROTULO.get(self.var_tipo1.get(), TIPO_CATMAT)
 
     def _start(self):
+        if not self._fontes_ok(): return
         arq = self.var_arquivo.get().strip()
         if not arq:
             messagebox.showerror("Arquivo obrigatório",
@@ -1821,22 +2396,27 @@ class App(ctk.CTk):
 
     def _pausar_por_conexao(self):
         """Pausa automática ao detectar queda de rede — NÃO cancela a extração.
-        Retoma automaticamente em 60s ou imediatamente se o usuário clicar Retomar."""
+        Retoma automaticamente em 60s ou imediatamente se o usuário clicar Retomar.
+        Chamada pelas threads de extração (várias ao mesmo tempo): o teste-e-
+        pausa é atômico e a interface só é tocada na thread principal."""
         if not self.processing: return
-        # Só loga/pausa se ainda não estava pausado por conexão
-        if not pausar_extracao.is_set(): return  # já está pausado
-        pausar_extracao.clear()
-        self.btn_pause.configure(state="normal", text="▶  Retomar agora")
-        self.set_status("Status: Sem conexão — retentando em 60s")
-        self._log("\n⚠️  Rede indisponível — retentando automaticamente em 60s.\n"
-                  "   Clique em ▶  Retomar agora para tentar imediatamente.", "warn")
-        # Atualizar contagem regressiva no status a cada segundo
-        def _countdown(seg):
-            if not self.processing or pausar_extracao.is_set(): return
-            self.set_status(f"Status: Sem conexão — retentando em {seg}s")
-            if seg > 0:
-                self.after(1000, lambda: _countdown(seg - 1))
-        self.after(1000, lambda: _countdown(59))
+        with _lock_pausa_conexao:
+            if not pausar_extracao.is_set(): return  # outra thread já pausou
+            pausar_extracao.clear()
+
+        def _mostrar():
+            self.btn_pause.configure(state="normal", text="▶  Retomar agora")
+            self.set_status("Status: Sem conexão — retentando em 60s")
+            self._log("\n⚠️  Rede indisponível — retentando automaticamente em 60s.\n"
+                      "   Clique em ▶  Retomar agora para tentar imediatamente.", "warn")
+            # Atualizar contagem regressiva no status a cada segundo
+            def _countdown(seg):
+                if not self.processing or pausar_extracao.is_set(): return
+                self.set_status(f"Status: Sem conexão — retentando em {seg}s")
+                if seg > 0:
+                    self.after(1000, lambda: _countdown(seg - 1))
+            self.after(1000, lambda: _countdown(59))
+        self._ui(_mostrar)
 
     def _salvar_log(self):
         p = filedialog.asksaveasfilename(defaultextension=".txt",
@@ -2006,6 +2586,7 @@ class App(ctk.CTk):
         self._start_busca(pdms, "apenas_buscar")
 
     def _buscar_e_extrair(self):
+        if not self._fontes_ok(): return
         pdms = self._pdms_sel()
         if not pdms: messagebox.showerror("Nenhum selecionado","Selecione PDMs."); return
         # Modo direto: pula a descoberta de CATMATs e consulta a Pesquisa de
@@ -2103,6 +2684,7 @@ class App(ctk.CTk):
         cancelar_busca_catmat = True
 
     def _iniciar_exp(self):
+        if not self._fontes_ok(): return
         if not self.lista_catmats:
             messagebox.showerror("Vazio","Nenhum CATMAT disponível."); return
         d_i, d_f, err = validar_e_obter_datas(self.var_ini2.get(), self.var_fim2.get())
@@ -2121,6 +2703,7 @@ class App(ctk.CTk):
 
     def _buscar_e_extrair_classes(self):
         """Fluxo automatizado: para cada classe, faz PDMs → CATMATs → Extração → Salva."""
+        if not self._fontes_ok(): return
         entrada = self.var_classe.get().strip()
         if not entrada:
             messagebox.showerror("Campo vazio", "Informe ao menos um código de Classe."); return
@@ -2144,6 +2727,7 @@ class App(ctk.CTk):
         fmt = self.var_fmt.get()
         self._salvar_corr = self.var_salvar_corr.get()   # capturado na thread principal
         self._pasta_corr  = self.var_pasta.get()
+        self._bps_cfg     = self._config_bps()
         self._pasta_classes_destino = pasta_dest
         self.processing   = True
         self.total_baixados = 0
@@ -2168,6 +2752,7 @@ class App(ctk.CTk):
         self.btn_log.configure(state="disabled")
 
         self._log("💾 Formato: " + ("CSV" if fmt == "csv" else "Excel"), "info")
+        self._log_config_bps(self._bps_cfg)
         if d_i or d_f:
             def fd(s):
                 p = s.split("-"); return p[2]+"-"+p[1]+"-"+p[0]
@@ -2198,10 +2783,10 @@ class App(ctk.CTk):
         tipo_busca = TIPO_PDM    → Classe → PDMs → Registros de Preços (direto)
         Retry em todos os níveis: classes, PDMs e CATMATs com erro.
         """
-        ext          = "csv" if fmt == "csv" else "xlsx"
         total_classes_orig = len(classes_lista)
         salvar_corr  = getattr(self, "_salvar_corr", False)
         pasta_corr   = getattr(self, "_pasta_corr", "")
+        bps_cfg      = getattr(self, "_bps_cfg", None)
         total_catmats_acum = 0
         classes_com_falha  = []   # classes que não retornaram PDMs
 
@@ -2210,9 +2795,7 @@ class App(ctk.CTk):
         def _extrair_codigos(classe, idx_c, total_c, codigos_lista):
 
             # ── 3. Extração dos Registros de Preços ───────────────────────────
-            nome_arq = "classe_" + classe + "." + ext
-            caminho  = os.path.join(pasta_dest, nome_arq) if pasta_dest else nome_arq
-            writer   = CSVChunkWriter(caminho) if fmt == "csv" else ExcelChunkWriter(caminho)
+            writer   = self._novo_writer(pasta_dest, fmt, classe)
 
             reg_baixados    = {}
             reg_esperados   = {}
@@ -2224,11 +2807,52 @@ class App(ctk.CTk):
             writer_lock = threading.Lock()
             state_lock  = threading.Lock()
             comp_count  = [0]
+            reg_bps     = {}          # código -> registros do BPS gravados
+            bps_falhas  = []          # CATMATs/PDMs que o BPS não respondeu
+            bps_erro    = set()       # códigos com alguma falha no BPS
+            bps_soma    = {"linhas": 0, "trocadas": 0}
 
-            def _processar_resultado(codigo, dfs_e_meta, tipo, reg_esp, pag_corr):
+            def _gravar_bps(codigo, bps):
+                if bps is None:
+                    return
+                n = 0 if bps["df"] is None else len(bps["df"])
+                if n:
+                    with writer_lock:
+                        writer.write_dataframe(bps["df"], aba=self._aba_bps(bps_cfg))
+                with state_lock:
+                    reg_bps[codigo] = reg_bps.get(codigo, 0) + n
+                    bps_soma["linhas"]   += n
+                    bps_soma["trocadas"] += bps["trocadas"]
+                    bps_falhas.extend(bps["falhas"])
+                    if bps["falhas"]:
+                        bps_erro.add(codigo)
+                    if not bps_cfg["compras"]:          # só BPS: é ele quem conta
+                        self.total_baixados += n
+                    reg = self.total_baixados
+                if not bps_cfg["compras"]:
+                    self._ui(lambda r=reg: self._stat("k_reg", f"{r:,}".replace(",",".")))
+                if bps["falhas"]:
+                    ftxt = ("⚠️  BPS sem resposta para " + ", ".join(map(str, bps["falhas"]))
+                            + " (código " + str(codigo) + ").")
+                    self._ui(lambda t=ftxt: self._log(t, "warn"))
+
+            def _processar_resultado(codigo, dfs_e_meta, tipo, reg_esp, pag_corr, bps=None):
                 nonlocal total_baixados_classe, vazios_classe, total_catmats_acum
+                # Código com erro volta para o retry, que busca o BPS de novo:
+                # gravar agora duplicaria as linhas da aba BPS
+                if tipo != "erro":
+                    _gravar_bps(codigo, bps)
                 if tipo == "conexao":
                     pass  # já tratado dentro de _fetch_catmat_registros via pausa automática
+                elif tipo == "pulado":                  # só BPS: Compras.gov não consultado
+                    if not reg_bps.get(codigo):
+                        vtxt = "ℹ️  " + str(codigo) + ": 0 registros no BPS."
+                        self._ui(lambda t=vtxt: self._log(t, "info"))
+                        with state_lock:
+                            vazios_classe += 1
+                            self.count_vazios += 1
+                            v = self.count_vazios
+                        self._ui(lambda vv=v: self._stat("k_vaz", vv))
                 elif tipo == "erro":
                     with state_lock:
                         catmats_com_erro.append(codigo)
@@ -2284,21 +2908,21 @@ class App(ctk.CTk):
                      self.lbl_pct.configure(text=str(int(p*100)) + "%")))
                 return tipo
 
-            # Extração sequencial (max_workers=1 — paralelismo sobrecarrega a API)
-            with ThreadPoolExecutor(max_workers=1) as executor:
+            # Paralelo até WORKERS_COMPRAS: quem limita o ritmo é a cota (_get_compras)
+            with ThreadPoolExecutor(max_workers=WORKERS_COMPRAS) as executor:
                 futures = {
-                    executor.submit(_fetch_catmat_registros, cod,
+                    executor.submit(_fetch_codigo, cod,
                                     d_ini, d_fim, salvar_corr, pasta_corr,
                                     self._pausar_por_conexao, tipo_busca,
-                                    lambda: not self.processing): cod
+                                    lambda: not self.processing, bps_cfg): cod
                     for cod in codigos_lista
                 }
                 for future in as_completed(futures):
                     pausar_extracao.wait()
                     if not self.processing:
                         executor.shutdown(wait=False, cancel_futures=True); break
-                    cod, dfs_m, tipo, reg_e, pag_c = future.result()
-                    res = _processar_resultado(cod, dfs_m, tipo, reg_e, pag_c)
+                    cod, dfs_m, tipo, reg_e, pag_c, bps = future.result()
+                    res = _processar_resultado(cod, dfs_m, tipo, reg_e, pag_c, bps)
                     if res == "conexao": break
 
             # Retry sequencial dos códigos com erro
@@ -2311,39 +2935,69 @@ class App(ctk.CTk):
                               str(e) + "s)…", "warn"))
                 time.sleep(espera)
                 retry_list = list(catmats_com_erro); catmats_com_erro.clear()
-                with ThreadPoolExecutor(max_workers=1) as executor:
+                with ThreadPoolExecutor(max_workers=WORKERS_COMPRAS) as executor:
                     futures = {
-                        executor.submit(_fetch_catmat_registros, cod,
+                        executor.submit(_fetch_codigo, cod,
                                         d_ini, d_fim, salvar_corr, pasta_corr,
                                         self._pausar_por_conexao, tipo_busca,
-                                        lambda: not self.processing): cod
+                                        lambda: not self.processing, bps_cfg): cod
                         for cod in retry_list
                     }
                     for future in as_completed(futures):
                         if not self.processing: break
-                        cod, dfs_m, tipo, reg_e, pag_c = future.result()
-                        _processar_resultado(cod, dfs_m, tipo, reg_e, pag_c)
+                        cod, dfs_m, tipo, reg_e, pag_c, bps = future.result()
+                        _processar_resultado(cod, dfs_m, tipo, reg_e, pag_c, bps)
 
             if catmats_com_erro:
                 n_def = len(catmats_com_erro)
                 self._ui(lambda n=n_def, rt=rotulo:
                     self._log("❌  " + str(n) + " " + rt + "(s) sem resposta após 3 tentativas.", "err"))
+                # O Compras.gov falhou de vez, mas o BPS é outro servidor: os
+                # dados dele ainda entram na aba BPS
+                if bps_cfg["aba"] and self.processing:
+                    for cod in catmats_com_erro:
+                        _gravar_bps(cod, _bps_do_codigo(cod, tipo_busca, d_ini, d_fim,
+                                                        lambda: not self.processing))
 
             if not self.processing: return True
 
             # ── 4. Finalizar arquivo desta classe ─────────────────────────────
             parts = writer.finalize()
             arqs  = ", ".join(os.path.basename(p) for p in parts) if parts else "(sem dados)"
-            self._ui(lambda c=classe, a=arqs, n=total_baixados_classe:
+            n_arq = total_baixados_classe if bps_cfg["compras"] else bps_soma["linhas"]
+            self._ui(lambda c=classe, a=arqs, n=n_arq:
                 self._log("📁  Classe " + c + " — " + str(n) + " registros → " + a, "info"))
+            if bps_cfg["compras"] and (bps_cfg["aba"] or bps_cfg["descricao"]):
+                partes_txt = []
+                if bps_cfg["aba"]:
+                    partes_txt.append(f"{bps_soma['linhas']:,}".replace(",", ".")
+                                      + " registros do BPS (aba " + ABA_BPS + ")")
+                if bps_cfg["descricao"]:
+                    partes_txt.append("descricaoItem trocado pelo texto do BPS em "
+                                      + f"{bps_soma['trocadas']:,}".replace(",", ".") + " linha(s)")
+                btxt = "🏥  Classe " + classe + " — " + " | ".join(partes_txt)
+                self._ui(lambda t=btxt: self._log(t, "info"))
+            if bps_falhas:
+                ftxt = ("❌  BPS sem resposta (" + str(len(bps_falhas)) + "): "
+                        + ", ".join(map(str, bps_falhas[:20]))
+                        + (" …" if len(bps_falhas) > 20 else ""))
+                self._ui(lambda t=ftxt: self._log(t, "err"))
 
             # ── 5. Relatório de integridade desta classe ──────────────────────
             rel_nome    = "Relatorio_Integridade_" + classe + ".xlsx"
             rel_caminho = os.path.join(pasta_dest, rel_nome) if pasta_dest else rel_nome
             try:
                 wb = Workbook(); ws = wb.active; ws.title = "Integridade_" + classe
-                ws.append([tipo_busca,"esperados","baixados","paginas","status"])
-                for c in codigos_lista:
+                if not bps_cfg["compras"]:              # só BPS
+                    ws.append([tipo_busca, "registros BPS", "status"])
+                    for c in codigos_lista:
+                        n = reg_bps.get(c, 0)
+                        ws.append([c, n, "ERRO: BPS sem resposta" if c in bps_erro
+                                   else "OK" if n else "sem registros no BPS"])
+                else:
+                    ws.append([tipo_busca,"esperados","baixados","paginas","status"]
+                              + (["registros BPS"] if bps_cfg["aba"] else []))
+                for c in (codigos_lista if bps_cfg["compras"] else []):
                     bx = int(reg_baixados.get(c, 0))
                     ex = int(reg_esperados.get(c, 0))
                     pg = pag_corrompidas.get(c, [])
@@ -2351,7 +3005,8 @@ class App(ctk.CTk):
                     st = ("OK" if d == 0 else
                           "OK (divergencia: " + str(bx) + "/" + str(ex) + ")" if d <= 2 else
                           "Inconsistencia Grave (" + str(bx) + "/" + str(ex) + ")")
-                    ws.append([c, ex, bx, ", ".join(map(str, pg)), st])
+                    ws.append([c, ex, bx, ", ".join(map(str, pg)), st]
+                              + ([reg_bps.get(c, 0)] if bps_cfg["aba"] else []))
                 if catmats_com_erro:
                     ws.append([])
                     ws.append(["--- " + rotulo + "s sem resposta apos 3 tentativas ---"])
@@ -2493,6 +3148,7 @@ class App(ctk.CTk):
     def _iniciar_processo(self, codigos, fmt, d_ini, d_fim, catmats_por_classe=None,
                           tipo=TIPO_CATMAT, por_classe=None, pasta_destino=None):
         if not codigos: return
+        if not self._fontes_ok(): return
         self.processing            = True
         self.codigos_lista         = codigos
         self._data_inicio          = d_ini
@@ -2502,6 +3158,12 @@ class App(ctk.CTk):
         # Tk não é thread-safe: capturar aqui, na thread principal
         self._salvar_corr          = self.var_salvar_corr.get()
         self._pasta_corr           = self.var_pasta.get()
+        self._bps_cfg              = self._config_bps()
+        self.registros_bps         = {}      # código -> registros gravados na aba BPS
+        self.bps_falhas            = []
+        self.bps_erro              = set()   # códigos com alguma falha no BPS
+        self.total_bps             = 0
+        self.bps_trocadas          = 0
         self._catmats_por_classe_ativo = catmats_por_classe or {}
         # Um arquivo por classe. Quando não há mapa prévio de códigos→classe,
         # a classe é lida do campo codigoClasse de cada registro.
@@ -2529,14 +3191,13 @@ class App(ctk.CTk):
             self.writer = None  # será None; usamos self._writers_por_classe
             self._writers_por_classe = {}  # classe → writer
         else:
-            self.writer = CSVChunkWriter("dados_completos_extraidos.csv") \
-                          if fmt == "csv" else \
-                          ExcelChunkWriter("dados_completos_extraidos.xlsx")
+            self.writer = self._novo_writer("", fmt)
             self._writers_por_classe = {}
 
         self.log.configure(state="normal"); self.log.delete("1.0","end")
         self.log.configure(state="disabled")
         self._log(f"💾 Formato: {'CSV' if fmt == 'csv' else 'Excel'}", "info")
+        self._log_config_bps(self._bps_cfg)
         if d_ini or d_fim:
             def fd(s): p = s.split("-"); return f"{p[2]}-{p[1]}-{p[0]}"
             txt = "📅 Filtro de datas:"
@@ -2579,14 +3240,10 @@ class App(ctk.CTk):
             classe_do_cod = classe or "sem_classe"
         classe_do_cod = re.sub(r'[\\/:*?"<>|]', "_", str(classe_do_cod)).strip() or "sem_classe"
         if classe_do_cod not in self._writers_por_classe:
-            ext   = "csv" if self._fmt == "csv" else "xlsx"
             # Salva direto na pasta escolhida pelo usuário (se informada)
             pasta = getattr(self, "_pasta_classes_destino", "").strip()
-            nome_arq = f"classe_{classe_do_cod}.{ext}"
-            caminho  = os.path.join(pasta, nome_arq) if pasta else nome_arq
-            self._writers_por_classe[classe_do_cod] = (
-                CSVChunkWriter(caminho) if self._fmt == "csv"
-                else ExcelChunkWriter(caminho))
+            self._writers_por_classe[classe_do_cod] = self._novo_writer(
+                pasta, self._fmt, classe_do_cod)
         return self._writers_por_classe[classe_do_cod]
 
     def _ui(self, fn):
@@ -2602,6 +3259,7 @@ class App(ctk.CTk):
         d_ini       = self._data_inicio
         d_fim       = self._data_fim
         tipo_busca  = getattr(self, "_tipo_busca", TIPO_CATMAT)
+        bps_cfg     = getattr(self, "_bps_cfg", None)
         writer_locks: dict = {}   # id(writer) → Lock
         state_lock  = threading.Lock()
         comp_count  = [0]
@@ -2613,12 +3271,12 @@ class App(ctk.CTk):
                 writer_locks[k] = threading.Lock()
             return w, writer_locks[k]
 
-        def _escrever(codigo, df_proc):
+        def _escrever(codigo, df_proc, aba=None):
             """Roteia o DataFrame para o writer certo, quebrando por classe."""
             if (not self._modo_por_classe or self._catmats_por_classe_ativo
                     or "codigoClasse" not in df_proc.columns):
                 w, lk = _wlock(codigo)
-                with lk: w.write_dataframe(df_proc)
+                with lk: w.write_dataframe(df_proc, aba=aba)
                 return
             # Classe lida do próprio registro: uma partição por classe encontrada
             chaves = (df_proc["codigoClasse"].astype(str).str.strip()
@@ -2626,7 +3284,31 @@ class App(ctk.CTk):
                                 "None": "sem_classe"}))
             for classe, parte in df_proc.groupby(chaves, sort=False):
                 w, lk = _wlock(codigo, str(classe))
-                with lk: w.write_dataframe(parte)
+                with lk: w.write_dataframe(parte, aba=aba)
+
+        def _gravar_bps(codigo, bps):
+            if bps is None:
+                return
+            n = 0 if bps["df"] is None else len(bps["df"])
+            if n:
+                _escrever(codigo, bps["df"], aba=self._aba_bps(bps_cfg))
+                _flush_periodico()
+            with state_lock:
+                self.registros_bps[codigo] = self.registros_bps.get(codigo, 0) + n
+                self.total_bps    += n
+                self.bps_trocadas += bps["trocadas"]
+                self.bps_falhas.extend(bps["falhas"])
+                if bps["falhas"]:
+                    self.bps_erro.add(codigo)
+                if not bps_cfg["compras"]:              # só BPS: é ele quem conta
+                    self.total_baixados += n
+                reg = self.total_baixados
+            if not bps_cfg["compras"]:
+                self._ui(lambda r=reg: self._stat("k_reg", f"{r:,}".replace(",",".")))
+            if bps["falhas"]:
+                ftxt = (f"⚠️  BPS sem resposta para {', '.join(map(str, bps['falhas']))}"
+                        f" (código {codigo}).")
+                self._ui(lambda t=ftxt: self._log(t, "warn"))
 
         def _flush_periodico():
             """Descarrega em disco o que já foi montado (throttled no writer)."""
@@ -2640,12 +3322,12 @@ class App(ctk.CTk):
                 with lk:
                     w.flush()
 
-        with ThreadPoolExecutor(max_workers=1) as executor:
+        with ThreadPoolExecutor(max_workers=WORKERS_COMPRAS) as executor:
             futures = {
-                executor.submit(_fetch_catmat_registros, cod,
+                executor.submit(_fetch_codigo, cod,
                                 d_ini, d_fim, salvar_corr, pasta_corr,
                                 self._pausar_por_conexao, tipo_busca,
-                                lambda: not self.processing): cod
+                                lambda: not self.processing, bps_cfg): cod
                 for cod in codigos
             }
             for future in as_completed(futures):
@@ -2653,7 +3335,10 @@ class App(ctk.CTk):
                 if not self.processing:
                     executor.shutdown(wait=False, cancel_futures=True); break
 
-                codigo, dfs_e_meta, tipo, reg_esp, pag_corr = future.result()
+                codigo, dfs_e_meta, tipo, reg_esp, pag_corr, bps = future.result()
+                # Nesta aba não há retry do Compras.gov: o BPS entra mesmo
+                # quando o código veio vazio ou com erro de lá
+                _gravar_bps(codigo, bps)
 
                 with state_lock:
                     comp_count[0] += 1
@@ -2661,6 +3346,18 @@ class App(ctk.CTk):
 
                 if tipo == "conexao":
                     pass  # já tratado dentro de _fetch_catmat_registros via pausa automática
+
+                elif tipo == "pulado":             # só BPS: Compras.gov não consultado
+                    n_bps = self.registros_bps.get(codigo, 0)
+                    if n_bps:
+                        self._ui(lambda cod=codigo, n=n_bps:
+                            self._log(f"✅  Cód {cod}: {n} registros no BPS.", "ok"))
+                    else:
+                        with state_lock:
+                            self.count_vazios += 1
+                            v = self.count_vazios
+                        self._ui(lambda cod=codigo: self._log(f"ℹ️  {cod}: 0 registros no BPS.", "info"))
+                        self._ui(lambda vv=v: self._stat("k_vaz", vv))
 
                 elif tipo in ("erro", "vazio"):
                     txt = (f"ℹ️  {codigo}: sem registro (erro API)." if tipo == "erro"
@@ -2736,12 +3433,36 @@ class App(ctk.CTk):
         if parts:
             self._log(f"💾 Arquivos gerados: {', '.join(parts)}", "info")
 
+        bps_cfg = getattr(self, "_bps_cfg", None) or {"compras": True, "aba": False,
+                                                       "descricao": False}
+        if bps_cfg["aba"] or bps_cfg["descricao"]:
+            partes_txt = []
+            if bps_cfg["aba"]:
+                partes_txt.append(f"{self.total_bps:,} registros"
+                                  + (f" na aba {ABA_BPS}" if bps_cfg["compras"] else ""))
+            if bps_cfg["descricao"]:
+                partes_txt.append(f"descricaoItem trocado pelo texto do BPS em "
+                                  f"{self.bps_trocadas:,} linha(s)")
+            self._log(("🏥 BPS: " + " | ".join(partes_txt)).replace(",", "."), "info")
+            if self.bps_falhas:
+                self._log(f"❌ BPS sem resposta ({len(self.bps_falhas)}): "
+                          + ", ".join(map(str, self.bps_falhas[:20]))
+                          + (" …" if len(self.bps_falhas) > 20 else ""), "err")
+
         # Relatório de integridade
         try:
             wb = Workbook(); ws = wb.active; ws.title = "Relatorio Integridade"
-            ws.append([getattr(self, "_tipo_busca", TIPO_CATMAT),
-                       "esperados","baixados","paginas","status"])
-            for c in self.codigos_lista:
+            tipo_rel = getattr(self, "_tipo_busca", TIPO_CATMAT)
+            if not bps_cfg["compras"]:                  # só BPS
+                ws.append([tipo_rel, "registros BPS", "status"])
+                for c in self.codigos_lista:
+                    n = self.registros_bps.get(c, 0)
+                    ws.append([c, n, "ERRO: BPS sem resposta" if c in self.bps_erro
+                               else "OK" if n else "sem registros no BPS"])
+            else:
+                ws.append([tipo_rel, "esperados","baixados","paginas","status"]
+                          + (["registros BPS"] if bps_cfg["aba"] else []))
+            for c in (self.codigos_lista if bps_cfg["compras"] else []):
                 bx = int(self.registros_baixados.get(c,0))
                 ex = int(self.registros_esperados.get(c,0))
                 pg = self.paginas_corrompidas.get(c,[])
@@ -2749,7 +3470,8 @@ class App(ctk.CTk):
                 st = ("OK" if d==0 else
                       f"OK (divergencia: {bx}/{ex})" if d<=2 else
                       f"Inconsistencia Grave ({bx}/{ex})")
-                ws.append([c,ex,bx,", ".join(map(str,pg)),st])
+                ws.append([c,ex,bx,", ".join(map(str,pg)),st]
+                          + ([self.registros_bps.get(c, 0)] if bps_cfg["aba"] else []))
             pasta_rel = getattr(self, "_pasta_classes_destino", "").strip()
             cam_rel = (os.path.join(pasta_rel, "Relatorio_Integridade.xlsx")
                        if pasta_rel else "Relatorio_Integridade.xlsx")
@@ -2777,10 +3499,15 @@ class App(ctk.CTk):
             chr(8212)*40,
             f"Codigos Processados:     {len(self.codigos_lista)}",
             f"Registros Consolidados:  {self.total_baixados:,}",
-            f"Paginas Reparadas:       {self.count_reparadas}",
-            f"Paginas com Perda:       {self.count_corrigidas}",
-            f"Codigos sem Registros:   {self.count_vazios}",
         ]
+        if bps_cfg["compras"]:
+            resumo_linhas += [
+                f"Paginas Reparadas:       {self.count_reparadas}",
+                f"Paginas com Perda:       {self.count_corrigidas}",
+            ]
+        resumo_linhas.append(f"Codigos sem Registros:   {self.count_vazios}")
+        if bps_cfg["compras"] and bps_cfg["aba"]:
+            resumo_linhas.append(f"Registros do BPS:        {self.total_bps:,}")
         if n_classes >= 1:
             resumo_linhas.append(f"Arquivos por classe:     {n_classes}")
         messagebox.showinfo("Resumo", "\n".join(resumo_linhas))
@@ -2816,7 +3543,10 @@ class App(ctk.CTk):
                     messagebox.showwarning("Atenção",
                         f"Nenhuma pasta escolhida. Arquivos na pasta do programa:\n{nomes}")
         else:
-            ultimo = parts[-1]
+            # No CSV a aba BPS é um arquivo à parte: ele acompanha o principal
+            extras = self.writer.arquivos_extras() if self.writer else []
+            principais = [p for p in parts if p not in extras]
+            ultimo = principais[-1] if principais else parts[-1]
             tipos  = [("Excel","*.xlsx")] if ext == ".xlsx" else [("CSV","*.csv")]
             dest   = filedialog.asksaveasfilename(
                         defaultextension=ext,
@@ -2825,8 +3555,15 @@ class App(ctk.CTk):
             if dest:
                 if not dest.lower().endswith(ext): dest += ext
                 shutil.copy(ultimo, dest)
+                copiados = []
+                for arq in extras:
+                    if arq == ultimo: continue
+                    alvo = os.path.join(os.path.dirname(dest), os.path.basename(arq))
+                    shutil.copy(arq, alvo); copiados.append(os.path.basename(arq))
                 messagebox.showinfo("Salvo",
-                    f"Dados salvos em:\n{dest}\n\nRelatorio de integridade na pasta do programa.")
+                    f"Dados salvos em:\n{dest}"
+                    + (f"\n\nDados do BPS: {', '.join(copiados)}" if copiados else "")
+                    + "\n\nRelatorio de integridade na pasta do programa.")
             else:
                 messagebox.showwarning("Atencao", f"Arquivo permanece em:\n{ultimo}")
 
@@ -2973,11 +3710,12 @@ class App(ctk.CTk):
             dw=[e["caminho"] for e in self._cons_entradas if e["origem"] == "dw"],
             da=[e["caminho"] for e in self._cons_entradas if e["origem"] == "da"],
             saida=saida,
-            prefixo=self.var_cons_prefixo.get().strip() or "bps_dw_da__Classe_",
+            prefixo=self.var_cons_prefixo.get() or "DA-DW Classe ",
             sufixo=self.var_cons_sufixo.get().strip(),
             ano_min=ano_min, ano_max=ano_max,
             salvar_duplicatas=bool(self.var_cons_dup.get()),
             dedup_interno_da=bool(self.var_cons_dedup_interno.get()),
+            processos=int(self.var_cons_processos.get() or 1),
         )
 
         self._cons_rodando  = True
@@ -3001,6 +3739,9 @@ class App(ctk.CTk):
         if ano_min or ano_max:
             self._log_cons(f"📅 Filtro de ano: "
                            f"{ano_min or '—'} a {ano_max or '—'}", "info")
+        if params["processos"] > 1:
+            self._log_cons(f"⚙ Gravação em {params['processos']} processos "
+                           f"paralelos (uma classe por processo).", "info")
         if params["dedup_interno_da"]:
             self._log_cons("⚠ Dedup interno do DA ativo: repetições da mesma "
                            "chave dentro do próprio DA também serão removidas.",
@@ -3084,7 +3825,7 @@ class App(ctk.CTk):
 
         pct = (t.get("da_dup", 0) / t["da_lidas"] * 100) if t.get("da_lidas") else 0
         self._log_cons("\n" + "═" * 58, "info")
-        self._log_cons(f"✅ {len(gerados)} planilha(s) gerada(s) em: "
+        self._log_cons(f"✅ {res.get('arquivos', len(gerados))} planilha(s) gerada(s) em: "
                        f"{res.get('pasta_saida','')}", "ok")
         self._log_cons(f"   Relatório: {res.get('relatorio','')}", "ok")
         self._log_cons(f"   DA removido (já estava no DW): "
@@ -3100,6 +3841,23 @@ class App(ctk.CTk):
                            f"corrompida(s) fora das planilhas — conteúdo "
                            f"preservado em {res.get('arquivo_quarentena','')}.",
                            "warn")
+        if res.get("catmat_prefixos"):
+            self._log_cons("• CATMAT do DW com dígitos a mais à esquerda "
+                           "(mantidos os 6 da direita): "
+                           + " | ".join(f"{k} → {self._fmt_br(v)} linhas"
+                                        for k, v in res["catmat_prefixos"].items()),
+                           "info")
+        if res.get("descricao_dw"):
+            d = res["descricao_dw"]
+            self._log_cons(f"• Descrição do DW: {self._fmt_br(d['do_da'])} linha(s) "
+                           f"com o descritivo do DA | {self._fmt_br(d['mantidas'])} "
+                           f"mantida(s) do DW ({self._fmt_br(d['catmats_sem_da'])} "
+                           f"CATMAT(s) sem compra no DA)", "info")
+        if res.get("celulas_higienizadas"):
+            self._log_cons(f"⚠ {self._fmt_br(res['celulas_higienizadas'])} célula(s) "
+                           f"tinham caracteres de controle e foram higienizadas "
+                           f"(o texto foi mantido, os caracteres viraram espaço).",
+                           "warn")
         if res.get("modalidades_desconhecidas"):
             self._log_cons("⚠ Códigos de modalidade não mapeados: "
                            + ", ".join(res["modalidades_desconhecidas"])
@@ -3109,7 +3867,7 @@ class App(ctk.CTk):
 
         messagebox.showinfo("Concluído",
             f"Consolidação finalizada!\n\n"
-            f"Planilhas geradas: {len(gerados)}\n"
+            f"Planilhas geradas: {res.get('arquivos', len(gerados))}\n"
             f"Linhas do DW: {self._fmt_br(t.get('dw', 0))}\n"
             f"Duplicatas removidas do DA: {self._fmt_br(t.get('da_dup', 0))}\n"
             f"Linhas do DA mantidas: {self._fmt_br(t.get('da_mantidas', 0))}\n\n"
@@ -3151,7 +3909,8 @@ CAMPO_DATA_DA = "dataCompra"
 
 # Formatar a data em dd/mm/aaaa custa ~35% de tempo a mais na gravação.
 # Com False, a data sai como aaaa-mm-dd (mais rápido, ainda é data de verdade).
-FORMATAR_DATA_BR = True
+# (FORMATAR_DATA_BR saiu: no xlsxwriter o formato de data vem do
+#  default_date_format da pasta de trabalho, não de cada célula.)
 
 # Modalidades do DA (códigos do SIASG). Complete se aparecerem códigos novos —
 # o script avisa no fim quais códigos não estavam mapeados.
@@ -3261,7 +4020,6 @@ COLS_DA = [
     ("Preço Total", "moeda", 14),
 ]
 
-_FORMATO_POR_TIPO = {"data": FORMATO_DATA, "qtde": FORMATO_QTDE, "moeda": FORMATO_MOEDA}
 
 
 # =============================================================================
@@ -3380,6 +4138,15 @@ except OverflowError:
     csv.field_size_limit(2 ** 31 - 1)
 
 
+def _cp1252_ou_byte(erro):
+    """Os 5 bytes que o Windows-1252 não define viram o caractere Latin-1."""
+    trecho = erro.object[erro.start:erro.end]
+    return "".join(chr(b) for b in trecho), erro.end
+
+
+codecs.register_error("cp1252_ou_byte", _cp1252_ou_byte)
+
+
 def _detectar_encoding(caminho: Path) -> str:
     with open(caminho, "rb") as fb:
         amostra = fb.read(1_048_576)
@@ -3391,7 +4158,9 @@ def _detectar_encoding(caminho: Path) -> str:
             return "utf-8"
         except UnicodeDecodeError:
             continue
-    return "latin-1"
+    # Windows-1252, não Latin-1: os CSVs do DA e o Catálogo trazem “aspas
+    # curvas” e travessões –, que em Latin-1 viram caracteres de controle.
+    return "cp1252"
 
 
 def _detectar_separador(linha: str) -> str:
@@ -3413,7 +4182,8 @@ def ler_tabela(caminho: Path):
             wb.close()
     else:
         enc = _detectar_encoding(caminho)
-        with open(caminho, "r", encoding=enc, newline="", errors="replace") as f:
+        erros = "cp1252_ou_byte" if enc == "cp1252" else "replace"
+        with open(caminho, "r", encoding=enc, newline="", errors=erros) as f:
             primeira = f.readline()
             sep = _detectar_separador(primeira)
             f.seek(0)
@@ -3455,10 +4225,58 @@ def _leitor(linha, idx):
     return g
 
 
+TAM_CATMAT = 6
+
+# Quantas vezes cada prefixo excedente foi removido do CATMAT do DW. Serve para
+# o log: se aparecer algo diferente de "1000", é sinal de que a origem mudou e
+# vale conferir antes de confiar no resultado.
+_CATMAT_PREFIXOS = {}
+
+
 def _catmat(valor: str):
     if CATMAT_COMO_TEXTO or not valor:
         return valor
     return inteiro(valor) if so_digitos(valor) == valor else valor
+
+
+def _catmat_dw(valor: str):
+    """No DW o CATMAT às vezes vem com dígitos a mais à esquerda (ex.: 1000610972
+    para o CATMAT 610972). Fica só com os 6 da direita.
+
+    Só mexe quando o valor é todo numérico e tem mais de 6 dígitos: qualquer
+    coisa com letra, símbolo ou 6 dígitos ou menos passa intacta, para não
+    inventar truncamento onde não há. O DA não passa por aqui — vem limpo da API.
+    """
+    if valor and len(valor) > TAM_CATMAT and so_digitos(valor) == valor:
+        prefixo = valor[:-TAM_CATMAT]
+        _CATMAT_PREFIXOS[prefixo] = _CATMAT_PREFIXOS.get(prefixo, 0) + 1
+        valor = valor[-TAM_CATMAT:]
+    return _catmat(valor)
+
+
+def _chave_catmat(valor) -> str:
+    """CATMAT como chave de comparação: só dígitos, sem zeros à esquerda
+    ("000183", "183" e 183 são o mesmo item)."""
+    s = txt(valor)
+    return (s.lstrip("0") or "0") if s.isdigit() else ""
+
+
+def _descricao_do_da(saida, descricoes: dict, troca: dict):
+    """Põe na linha do DW o descritivo que o DA usa para o mesmo CATMAT.
+    Sem o CATMAT no DA, a descrição do próprio DW é mantida."""
+    cod = _chave_catmat(saida[1])
+    nova = descricoes.get(cod)
+    if nova is None:
+        troca["mantidas"] += 1
+        if cod:
+            troca["sem_da"].add(cod)
+        return
+    saida[2] = nova
+    troca["do_da"] += 1
+
+
+def _troca_vazia() -> dict:
+    return {"do_da": 0, "mantidas": 0, "sem_da": set()}
 
 
 def transformar_dw(linha, idx):
@@ -3478,7 +4296,7 @@ def transformar_dw(linha, idx):
     total = round(qtde * preco, 2) if (qtde is not None and preco is not None) else None
     saida = [
         chave,
-        _catmat(g("catmat")),
+        _catmat_dw(g("catmat")),
         g("descricao material servico"),
         g("unidade fornecimento"),
         inteiro(classe),
@@ -3599,87 +4417,204 @@ def _letra(i: int) -> str:
     return letra
 
 
-class SaidaClasse:
-    """Um arquivo .xlsx por classe, com as abas dw-XXXX e da-XXXX."""
+# =============================================================================
+# SAÍDA: uma pasta de trabalho por classe, com exatamente as abas DW e DA
+# =============================================================================
 
-    def __init__(self, classe: str):
-        self.classe = classe
-        self.wb = Workbook(write_only=True)
-        self.abas = {"dw": [], "da": []}
-        self._nova_aba("dw")                      # garante a aba do DW mesmo vazia
+_CAB_XLSX = {"bold": True, "bg_color": "1F4E79", "font_color": "FFFFFF",
+             "align": "center", "valign": "vcenter", "text_wrap": True}
+_NUM_XLSX = {"data": FORMATO_DATA, "qtde": FORMATO_QTDE, "moeda": FORMATO_MOEDA}
 
-    def _nova_aba(self, tipo: str):
-        cols = COLS_DW if tipo == "dw" else COLS_DA
-        n = len(self.abas[tipo]) + 1
-        nome = f"{tipo}-{self.classe}" + (f" ({n})" if n > 1 else "")
-        ws = self.wb.create_sheet(nome[:31])
-        for i, (_titulo, tipo_col, largura) in enumerate(cols):
-            dim = ws.column_dimensions[_letra(i)]
-            dim.width = largura
-            if tipo_col in _FORMATO_POR_TIPO and tipo_col != "data":
-                dim.number_format = _FORMATO_POR_TIPO[tipo_col]
-        cabecalho = []
-        for titulo, _t, _l in cols:
-            c = WriteOnlyCell(ws, value=titulo)
-            c.font, c.fill, c.alignment = _FONTE_CAB, _FUNDO_CAB, _ALINHA_CAB
-            cabecalho.append(c)
-        # Em modo write_only, tudo o que vem antes de <sheetData> (painéis,
-        # larguras, formatos de coluna) precisa ser definido ANTES do primeiro
-        # append; o atributo simples ws.freeze_panes não é serializado.
-        Worksheet.freeze_panes.fset(ws, "A2")
-        ws.append(cabecalho)
-        registro = [ws, 1]
-        self.abas[tipo].append(registro)
-        return registro
 
-    def append(self, tipo: str, valores: list):
-        registro = self.abas[tipo][-1] if self.abas[tipo] else self._nova_aba(tipo)
-        if registro[1] >= LIMITE_LINHAS_PLANILHA:
-            registro = self._nova_aba(tipo)
-        ws = registro[0]
-        if FORMATAR_DATA_BR:
-            cols = COLS_DW if tipo == "dw" else COLS_DA
-            valores = list(valores)
-            for i, (_t, tipo_col, _l) in enumerate(cols):
-                if tipo_col == "data" and valores[i] is not None:
-                    c = WriteOnlyCell(ws, value=valores[i])
-                    c.number_format = FORMATO_DATA
-                    valores[i] = c
-        ws.append(valores)
+class SaidaParte:
+    """Uma pasta de trabalho .xlsx com exatamente duas abas: DW e DA.
+
+    Quando uma classe não cabe em um único arquivo (limite de 1.048.576 linhas
+    por aba do Excel), o excedente vai para "... - Parte 2", "... - Parte 3" —
+    nunca para uma terceira aba. O corte é feito em fronteira de ano, de modo
+    que um ano nunca fica dividido entre dois arquivos (a menos que o ano
+    sozinho estoure o limite, caso raro que é avisado no log).
+    """
+
+    celulas_higienizadas = 0            # zerado a cada consolidar()
+
+    def __init__(self, caminho: Path, linhas_previstas: dict):
+        self.caminho = caminho
+        self.wb = xlsxwriter.Workbook(str(caminho), {
+            "constant_memory": True,           # escreve linha a linha, sem inchar a RAM
+            "default_date_format": FORMATO_DATA,
+            "strings_to_numbers": False,       # "000183" continua texto
+            "strings_to_urls": False,          # descrição longa não vira hyperlink
+        })
+        fmt_cab = self.wb.add_format(_CAB_XLSX)
+        self.abas = {}
+        for fonte, cols in (("dw", COLS_DW), ("da", COLS_DA)):
+            ws = self.wb.add_worksheet(fonte.upper())
+            for i, (_titulo, tipo_col, largura) in enumerate(cols):
+                # No xlsxwriter o formato de coluna já vale para as células
+                # escritas sem formato próprio — não é preciso criar um objeto
+                # de célula por data, como o openpyxl exigia.
+                if tipo_col in _NUM_XLSX:
+                    ws.set_column(i, i, largura,
+                                  self.wb.add_format({"num_format": _NUM_XLSX[tipo_col]}))
+                else:
+                    ws.set_column(i, i, largura)
+            ws.freeze_panes(1, 0)
+            ws.write_row(0, 0, [t for t, _x, _l in cols], fmt_cab)
+            n = max(linhas_previstas.get(fonte, 0), 1)
+            ws.autofilter(0, 0, n, len(cols) - 1)
+            self.abas[fonte] = [ws, 0]
+
+    def append(self, fonte: str, valores: list) -> bool:
+        """Grava uma linha. Devolve False se a aba encheu (não coube)."""
+        registro = self.abas[fonte]
+        if registro[1] >= LIMITE_LINHAS_PLANILHA - 1:      # -1 por causa do cabeçalho
+            return False
+        # Caracteres de controle (\x00-\x1f) vêm no texto livre da origem. O
+        # openpyxl levantava IllegalCharacterError e matava a aba; o xlsxwriter
+        # é pior, escreve "MICRODONT_x0001_ STERIL" em silêncio. Por isso a
+        # limpeza é preventiva. O search() antes do sub() custa ~1,6s por milhão
+        # de linhas, contra ~110s que a escrita dessas linhas leva.
+        for i, v in enumerate(valores):
+            if type(v) is str and _CTRL_ILEGAIS.search(v):
+                valores[i] = _CTRL_ILEGAIS.sub(" ", v)
+                SaidaParte.celulas_higienizadas += 1
         registro[1] += 1
+        registro[0].write_row(registro[1], 0, valores)
+        return True
+
+    def fechar(self):
+        self.wb.close()
 
     def descartar(self):
-        """Abandona a planilha sem gravar (cancelamento).
+        """Cancelamento: fecha os temporários e apaga o arquivo pela metade."""
+        try:
+            self.wb.close()
+        except Exception:
+            pass
+        try:
+            if self.caminho.exists():
+                self.caminho.unlink()
+        except Exception:
+            pass
 
-        Em modo write_only cada aba escreve num arquivo temporário através de
-        um gerador lxml. Se o objeto simplesmente for coletado pelo garbage
-        collector, o gerador é fechado no meio de um elemento XML e o Python
-        imprime um "Exception ignored ... LxmlSyntaxError". Fechar na ordem
-        certa (aba -> tempfile) evita o ruído e ainda apaga os temporários.
-        """
-        for registros in self.abas.values():
-            for registro in registros:
-                ws = registro[0]
-                try:
-                    ws.close()
-                except Exception:
-                    pass
-                escritor = getattr(ws, "_writer", None)
-                if escritor is not None:
-                    try:
-                        escritor.cleanup()
-                    except Exception:
-                        pass
-        self.abas = {"dw": [], "da": []}
 
-    def salvar(self, caminho: Path):
-        for tipo, cols in (("dw", COLS_DW), ("da", COLS_DA)):
-            if not self.abas[tipo]:
-                self._nova_aba(tipo)
-            ultima = _letra(len(cols) - 1)
-            for ws, linhas in self.abas[tipo]:
-                ws.auto_filter.ref = f"A1:{ultima}{max(linhas, 1)}"
-        self.wb.save(caminho)
+# =============================================================================
+# PLANEJAMENTO DAS PARTES
+# =============================================================================
+
+def _rotulo_ano(ano):
+    return str(ano) if ano else "sem ano"
+
+
+def planejar_partes(contagens: dict, prefixo: str, sufixo: str,
+                    log=print) -> tuple:
+    """Decide quantos arquivos cada classe terá e qual ano vai em qual.
+
+    contagens: {(classe, ano): {"dw": n, "da": n}}  -- ano é int ou None
+    Devolve (plano, roteador):
+        plano[classe]                 = [{"parte":1,"nome":...,"anos":[...],
+                                          "dw":n,"da":n}, ...]
+        roteador[(classe, ano, fonte)] = [(quantidade, indice_parte), ...]
+    O roteador é uma lista porque um único ano grande demais precisa ser
+    dividido entre partes; no caso normal ela tem um elemento só.
+    """
+    limite = LIMITE_LINHAS_PLANILHA - 1
+    classes = sorted({c for c, _a in contagens})
+    plano, roteador = {}, {}
+
+    for classe in classes:
+        anos = sorted({a for c, a in contagens if c == classe},
+                      key=lambda a: (a is None, a or 0))   # "sem ano" por último
+        partes = [{"parte": 1, "anos": [], "dw": 0, "da": 0}]
+        for ano in anos:
+            q = contagens[(classe, ano)]
+            atual = partes[-1]
+            # Cabe inteiro na parte corrente?
+            if (atual["dw"] + q["dw"] <= limite and atual["da"] + q["da"] <= limite):
+                if q["dw"] or q["da"]:
+                    atual["anos"].append(ano)
+                    atual["dw"] += q["dw"]; atual["da"] += q["da"]
+                    for fonte in ("dw", "da"):
+                        if q[fonte]:
+                            roteador[(classe, ano, fonte)] = [(q[fonte], len(partes) - 1)]
+                continue
+            # Não cabe: abre parte nova, salvo se o ano sozinho estoura o limite
+            if q["dw"] <= limite and q["da"] <= limite:
+                if not atual["anos"]:                     # parte vazia, evita buraco
+                    partes.pop()
+                partes.append({"parte": len(partes) + 1, "anos": [ano],
+                               "dw": q["dw"], "da": q["da"]})
+                for fonte in ("dw", "da"):
+                    if q[fonte]:
+                        roteador[(classe, ano, fonte)] = [(q[fonte], len(partes) - 1)]
+                continue
+            # Caso raro: um único ano maior que o limite -> divide o ano
+            log(f"  ! Classe {classe}, ano {_rotulo_ano(ano)}: "
+                f"dw={q['dw']:,} da={q['da']:,} — o ano sozinho passa do limite "
+                f"do Excel e precisou ser dividido entre arquivos."
+                .replace(",", "."))
+            idx_inicial = len(partes) - 1
+            for fonte in ("dw", "da"):
+                restante, trechos = q[fonte], []
+                idx = idx_inicial      # cada fonte enche a partir da mesma parte,
+                                       # senão o DA começaria depois do DW e
+                                       # deixaria abas DA vazias nas primeiras
+                while restante > 0:
+                    livre = limite - partes[idx][fonte]
+                    if livre <= 0:
+                        partes.append({"parte": len(partes) + 1, "anos": [],
+                                       "dw": 0, "da": 0})
+                        idx = len(partes) - 1
+                        continue
+                    usa = min(livre, restante)
+                    partes[idx][fonte] += usa
+                    if ano not in partes[idx]["anos"]:
+                        partes[idx]["anos"].append(ano)
+                    trechos.append((usa, idx))
+                    restante -= usa
+                    idx += 1
+                    if restante and idx >= len(partes):
+                        partes.append({"parte": len(partes) + 1, "anos": [],
+                                       "dw": 0, "da": 0})
+                if trechos:
+                    roteador[(classe, ano, fonte)] = trechos
+
+        partes = [p for p in partes if p["dw"] or p["da"]]
+        for i, p in enumerate(partes, start=1):
+            p["parte"] = i
+            p["nome"] = (f"{prefixo}{classe}{sufixo}"
+                         + (f" - Parte {i}" if i > 1 else "") + ".xlsx")
+        plano[classe] = partes
+
+    return plano, roteador
+
+
+class Roteador:
+    """Diz em qual parte cada linha deve cair, na ordem em que ela aparece.
+
+    A contagem da 1ª passada e a gravação da 2ª leem os mesmos arquivos na
+    mesma ordem, então o n-ésimo registro de (classe, ano, fonte) é sempre o
+    mesmo nas duas — é isso que torna o plano determinístico.
+    """
+
+    def __init__(self, roteador: dict, partes_abertas: dict):
+        self._plano = roteador
+        self._abertas = partes_abertas          # {(classe, indice): SaidaParte}
+        self._vistas = {}
+
+    def destino(self, classe, ano, fonte):
+        chave = (classe, ano, fonte)
+        trechos = self._plano.get(chave)
+        if not trechos:
+            return None
+        n = self._vistas.get(chave, 0)
+        self._vistas[chave] = n + 1
+        for quantidade, idx in trechos:
+            if n < quantidade:
+                return self._abertas.get((classe, idx))
+            n -= quantidade
+        return self._abertas.get((classe, trechos[-1][1]))
 
 
 # =============================================================================
@@ -3744,12 +4679,28 @@ class Quarentena:
             self._arq.close()
 
 
-def processar_dw(arquivos, saidas, estatisticas, chaves_dw, ano_min, ano_max,
-                 quarentena, verbose=True, log=print, cancelado=None,
-                 progresso=None):
+def processar_dw(arquivos, estatisticas, chaves_dw, ano_min, ano_max,
+                 quarentena, modo="contar", contagens=None, roteador=None,
+                 verbose=True, log=print, cancelado=None, progresso=None,
+                 ao_gravar=None, descricoes=None, troca_desc=None):
+    """Percorre os arquivos do DW.
+
+    modo="contar": monta o índice de chaves, as estatísticas, a quarentena e a
+        contagem por (classe, ano) que alimenta o plano de partes.
+    modo="gravar": repete exatamente a mesma triagem, mas só escreve nas
+        planilhas já abertas. Com `descricoes` ({catmat: texto do DA}), a
+        descrição de cada linha é trocada pela do DA e contada em `troca_desc`.
+
+    As duas passadas leem os mesmos arquivos na mesma ordem, então a n-ésima
+    linha de cada (classe, ano) é a mesma nas duas. É isso que faz o plano
+    fechar: sem contar antes, não há como saber em que ano cortar o arquivo,
+    porque as linhas não chegam em ordem de ano.
+    """
+    contando = (modo == "contar")
+    total = len(arquivos)
     for i_arq, arq in enumerate(arquivos, start=1):
         if progresso:
-            progresso(i_arq - 1, len(arquivos), f"DW · {arq.name}")
+            progresso(i_arq - 1, total, f"DW · {arq.name}")
         if cancelado and cancelado():
             raise Cancelado()
         gen = ler_tabela(arq)
@@ -3757,7 +4708,7 @@ def processar_dw(arquivos, saidas, estatisticas, chaves_dw, ano_min, ano_max,
             idx = indices(next(gen))
         except StopIteration:
             continue
-        if "classe" not in idx:
+        if contando and "classe" not in idx:
             log(f"  ! {arq.name}: coluna 'Classe' não encontrada - as linhas irão "
                 f"para SEM_CLASSE")
         gravadas = ignoradas = invalidas = 0
@@ -3769,37 +4720,65 @@ def processar_dw(arquivos, saidas, estatisticas, chaves_dw, ano_min, ano_max,
                 continue
             chave, classe, saida, erro = transformar_dw(linha, idx)
             if erro:
-                invalidas += 1
-                _est(estatisticas, classe if classe.isdigit() else "SEM_CLASSE")["dw_invalidas"] += 1
-                quarentena.registrar("DW", arq.name, n_linha, erro, linha)
+                if contando:
+                    invalidas += 1
+                    _est(estatisticas,
+                         classe if classe.isdigit() else "SEM_CLASSE")["dw_invalidas"] += 1
+                    quarentena.registrar("DW", arq.name, n_linha, erro, linha)
                 continue
             classe = classe or "SEM_CLASSE"
-            chaves_dw.add(int(chave))              # int ocupa menos memória que str
-            ano = saida[16]
+            if contando:
+                chaves_dw.add(int(chave))      # int ocupa menos memória que str
+            ano = saida[16]                    # Ano Resultado Compra
             if (ano_min and ano and ano < ano_min) or (ano_max and ano and ano > ano_max):
                 ignoradas += 1
                 continue
-            if classe not in saidas:
-                saidas[classe] = SaidaClasse(classe)
-            saidas[classe].append("dw", saida)
-            _est(estatisticas, classe)["dw"] += 1
+            if contando:
+                contagens.setdefault((classe, ano), {"dw": 0, "da": 0})["dw"] += 1
+                _est(estatisticas, classe)["dw"] += 1
+            else:
+                destino = roteador.destino(classe, ano, "dw")
+                if destino is not None:
+                    if descricoes is not None:
+                        _descricao_do_da(saida, descricoes, troca_desc)
+                    destino.append("dw", saida)
+                    if ao_gravar:
+                        ao_gravar()
             gravadas += 1
-        if verbose:
+        if verbose and contando:
             extra = f" | {ignoradas} fora do filtro de ano" if ignoradas else ""
             extra += f" | {invalidas} em quarentena" if invalidas else ""
             log(f"  [DW] {arq.name}: {gravadas:,} linhas{extra}".replace(",", "."))
     if progresso:
-        progresso(len(arquivos), len(arquivos), "DW concluído")
+        progresso(total, total, "DW concluído" if contando else "DW gravado")
 
 
-def processar_da(arquivos, saidas, estatisticas, chaves_dw, ano_min, ano_max,
+
+def processar_da(arquivos, estatisticas, chaves_dw, ano_min, ano_max,
                  dedup_interno, escritor_dup, modalidades_desconhecidas,
-                 quarentena, verbose=True, log=print, cancelado=None,
-                 progresso=None):
+                 quarentena, modo="contar", contagens=None, roteador=None,
+                 verbose=True, log=print, cancelado=None, progresso=None,
+                 ao_gravar=None, pular=None, pular_registro=None,
+                 descricoes=None):
+    """Percorre os arquivos do DA. Mesmos dois modos do processar_dw.
+
+    Na contagem, `pular_registro` recebe o número das linhas descartadas como
+    duplicata. Na gravação, `pular` traz essa mesma lista de volta e as linhas
+    são puladas sem consultar o índice de chaves — que aí nem precisa existir.
+    É o que permite gravar em outro processo sem replicar centenas de MB.
+
+    Na contagem, `descricoes` recebe {catmat: (dataHoraAtualizacaoItem, texto)}
+    de toda linha válida — duplicatas e anos fora do filtro inclusive, porque
+    servem para dar ao DW o descritivo do DA. Vale o texto mais recente.
+    """
+    contando = (modo == "contar")
     vistas_da = set() if dedup_interno else None
+    total = len(arquivos)
     for i_arq, arq in enumerate(arquivos, start=1):
+        pular_aqui = (pular or {}).get(str(arq)) if pular is not None else None
+        cursor = 0
         if progresso:
-            progresso(i_arq - 1, len(arquivos), f"DA · {arq.name}")
+            progresso(i_arq - 1, total, f"DA · {arq.name}")
         if cancelado and cancelado():
             raise Cancelado()
         gen = ler_tabela(arq)
@@ -3807,6 +4786,7 @@ def processar_da(arquivos, saidas, estatisticas, chaves_dw, ano_min, ano_max,
             idx = indices(next(gen))
         except StopIteration:
             continue
+        i_data = idx.get("datahoraatualizacaoitem")
         lidas = dup = mantidas = ignoradas = invalidas = 0
         for n_linha, linha in enumerate(gen, start=2):
             if cancelado and n_linha % _INTERVALO_CANCELAMENTO == 0 and cancelado():
@@ -3816,47 +4796,71 @@ def processar_da(arquivos, saidas, estatisticas, chaves_dw, ano_min, ano_max,
                 continue
             primeira = txt(linha[0]).lower()
             if primeira.startswith(("totalregistros", "totalpaginas", "idcompra")):
-                continue                            # rodapé da API ou cabeçalho repetido
+                continue                        # rodapé da API ou cabeçalho repetido
             lidas += 1
-            chave, classe, saida, erro = transformar_da(linha, idx, modalidades_desconhecidas)
+            chave, classe, saida, erro = transformar_da(linha, idx,
+                                                        modalidades_desconhecidas)
             if erro:
-                invalidas += 1
-                _est(estatisticas, classe if classe.isdigit() else "SEM_CLASSE")["da_invalidas"] += 1
-                quarentena.registrar("DA", arq.name, n_linha, erro, linha)
+                if contando:
+                    invalidas += 1
+                    _est(estatisticas,
+                         classe if classe.isdigit() else "SEM_CLASSE")["da_invalidas"] += 1
+                    quarentena.registrar("DA", arq.name, n_linha, erro, linha)
                 continue
             classe = classe or "SEM_CLASSE"
-            e = _est(estatisticas, classe)
-            e["da_lidas"] += 1
+            if contando:
+                _est(estatisticas, classe)["da_lidas"] += 1
+                if descricoes is not None and saida[2]:
+                    cod = _chave_catmat(saida[1])
+                    data = txt(linha[i_data]) if i_data is not None and i_data < len(linha) else ""
+                    atual = descricoes.get(cod)
+                    if cod and (atual is None or data > atual[0]):
+                        descricoes[cod] = (data, saida[2])
 
-            if int(chave) in chaves_dw:
-                dup += 1
-                e["da_dup"] += 1
-                if escritor_dup:
-                    escritor_dup.writerow([classe, chave, arq.name, saida[1],
-                                           saida[15] or "", saida[12], saida[18]])
-                continue
-            if vistas_da is not None:
-                if int(chave) in vistas_da:
-                    e["da_dup_interna"] += 1
+            if contando:
+                if int(chave) in chaves_dw:
+                    dup += 1
+                    _est(estatisticas, classe)["da_dup"] += 1
+                    if escritor_dup:
+                        escritor_dup.writerow([classe, chave, arq.name, saida[1],
+                                               saida[15] or "", saida[12], saida[18]])
+                    if pular_registro is not None:
+                        pular_registro.setdefault(str(arq), array("l")).append(n_linha)
                     continue
-                vistas_da.add(int(chave))
+                if vistas_da is not None:
+                    if int(chave) in vistas_da:
+                        _est(estatisticas, classe)["da_dup_interna"] += 1
+                        if pular_registro is not None:
+                            pular_registro.setdefault(str(arq), array("l")).append(n_linha)
+                        continue
+                    vistas_da.add(int(chave))
+            elif pular_aqui is not None:
+                if cursor < len(pular_aqui) and pular_aqui[cursor] == n_linha:
+                    cursor += 1
+                    dup += 1
+                    continue
 
-            ano = saida[14]
+            ano = saida[14]                     # Ano, derivado de dataCompra
             if (ano_min and ano and ano < ano_min) or (ano_max and ano and ano > ano_max):
                 ignoradas += 1
                 continue
-            if classe not in saidas:
-                saidas[classe] = SaidaClasse(classe)
-            saidas[classe].append("da", saida)
-            e["da_mantidas"] += 1
+            if contando:
+                contagens.setdefault((classe, ano), {"dw": 0, "da": 0})["da"] += 1
+                _est(estatisticas, classe)["da_mantidas"] += 1
+            else:
+                destino = roteador.destino(classe, ano, "da")
+                if destino is not None:
+                    destino.append("da", saida)
+                    if ao_gravar:
+                        ao_gravar()
             mantidas += 1
-        if verbose:
+        if verbose and contando:
             extra = f" | {ignoradas} fora do filtro de ano" if ignoradas else ""
             extra += f" | {invalidas} em quarentena" if invalidas else ""
             log(f"  [DA] {arq.name}: {lidas:,} lidas | {dup:,} duplicadas removidas | "
                 f"{mantidas:,} mantidas{extra}".replace(",", "."))
     if progresso:
-        progresso(len(arquivos), len(arquivos), "DA concluído")
+        progresso(total, total, "DA concluído" if contando else "DA gravado")
 
 
 def gravar_relatorio(caminho: Path, estatisticas: dict, arquivos_gerados: dict):
@@ -3884,21 +4888,187 @@ def gravar_relatorio(caminho: Path, estatisticas: dict, arquivos_gerados: dict):
 
 
 # =============================================================================
+# GRAVAÇÃO EM PARALELO (um processo por grupo de classes)
+# =============================================================================
+#
+# Só a 2ª passada é paralelizada, e é onde está o tempo: ler e transformar são
+# ~8% do trabalho, gravar o .xlsx é ~92%. Cada processo abre e fecha as próprias
+# pastas de trabalho, então não há estado compartilhado — o que cruza a fronteira
+# entre processos é só o plano (pequeno) e as linhas do DA a pular.
+#
+# Os trabalhadores NÃO recebem o índice de chaves do DW: seriam centenas de MB
+# replicados. Em vez disso a 1ª passada anota o número das linhas do DA que
+# foram descartadas como duplicata, e o trabalhador simplesmente as pula. Isso
+# ainda libera o índice antes da parte pesada do serviço.
+
+
+def _dividir_classes(plano: dict, n_grupos: int) -> list:
+    """Distribui as classes entre os processos equilibrando o total de linhas.
+
+    Guloso, da maior para a menor: a classe mais pesada vai sempre para o grupo
+    mais folgado. Sem isso, uma classe grande sozinha num grupo faria todos os
+    outros processos terminarem cedo e ficarem esperando.
+    """
+    pesos = {c: sum(p["dw"] + p["da"] for p in partes)
+             for c, partes in plano.items()}
+    grupos = [{"classes": [], "peso": 0} for _ in range(max(1, n_grupos))]
+    for classe in sorted(pesos, key=lambda c: -pesos[c]):
+        g = min(grupos, key=lambda g: g["peso"])
+        g["classes"].append(classe)
+        g["peso"] += pesos[classe]
+    return [g["classes"] for g in grupos if g["classes"]]
+
+
+def _tarefa_gravar(tarefa: dict, fila, evento_cancelar):
+    """Executado em processo separado: grava as partes das classes recebidas."""
+    saidas = {}
+    try:
+        SaidaParte.celulas_higienizadas = 0
+        dir_saida = Path(tarefa["saida"])
+        for classe, partes in tarefa["plano"].items():
+            for i, p in enumerate(partes):
+                saidas[(classe, i)] = SaidaParte(dir_saida / p["nome"],
+                                                 {"dw": p["dw"], "da": p["da"]})
+        roteador = Roteador(tarefa["rotas"], saidas)
+        arquivos_dw = [Path(a) for a in tarefa["arquivos_dw"]]
+        arquivos_da = [Path(a) for a in tarefa["arquivos_da"]]
+
+        escritas = [0]
+        def _contar(n=1):
+            escritas[0] += n
+            if escritas[0] % 20000 == 0:
+                fila.put(("prog", 20000))
+
+        cancelado = evento_cancelar.is_set
+        troca = _troca_vazia()
+        processar_dw(arquivos_dw, {}, None, tarefa["ano_min"], tarefa["ano_max"],
+                     None, modo="gravar", roteador=roteador, verbose=False,
+                     cancelado=cancelado, ao_gravar=_contar,
+                     descricoes=tarefa["descricoes_da"], troca_desc=troca)
+        processar_da(arquivos_da, {}, None, tarefa["ano_min"], tarefa["ano_max"],
+                     False, None, set(), None, modo="gravar", roteador=roteador,
+                     pular=tarefa["pular_da"], verbose=False,
+                     cancelado=cancelado, ao_gravar=_contar)
+
+        for (classe, _i), parte in sorted(saidas.items()):
+            parte.fechar()
+            fila.put(("log", f"  ✓ {parte.caminho.name}"))
+        fila.put(("prog", escritas[0] % 20000))
+        fila.put(("ok", {"celulas": SaidaParte.celulas_higienizadas,
+                         "classes": list(tarefa["plano"]),
+                         "troca": troca}))
+    except Cancelado:
+        for parte in saidas.values():
+            parte.descartar()
+        fila.put(("cancelado", None))
+    except Exception as e:
+        for parte in saidas.values():
+            parte.descartar()
+        fila.put(("erro", f"{type(e).__name__}: {e}"))
+
+
+def gravar_em_paralelo(plano, rotas, arquivos_dw, arquivos_da, dir_saida,
+                       ano_min, ano_max, pular_da, n_processos, total_linhas,
+                       log=print, progresso=None, cancelado=None,
+                       descricoes=None) -> dict:
+    """Dispara os processos e vai repassando log e progresso para a interface."""
+    # spawn em todo lugar: é o único modo do Windows, e usá-lo também no Linux
+    # evita que um bug só apareça na máquina do usuário.
+    ctx = multiprocessing.get_context("spawn")
+    fila, evento = ctx.Queue(), ctx.Event()
+    grupos = _dividir_classes(plano, n_processos)
+
+    processos = []
+    for classes in grupos:
+        tarefa = {
+            "saida": str(dir_saida),
+            "arquivos_dw": [str(a) for a in arquivos_dw],
+            "arquivos_da": [str(a) for a in arquivos_da],
+            "plano": {c: plano[c] for c in classes},
+            "rotas": {k: v for k, v in rotas.items() if k[0] in set(classes)},
+            "pular_da": pular_da,
+            "descricoes_da": descricoes,
+            "ano_min": ano_min, "ano_max": ano_max,
+        }
+        p = ctx.Process(target=_tarefa_gravar, args=(tarefa, fila, evento),
+                        daemon=True)
+        p.start()
+        processos.append(p)
+        log(f"  processo {p.pid}: classe(s) {', '.join(classes)}")
+
+    resumo = {"celulas": 0, "erro": None, "cancelado": False, "troca": _troca_vazia()}
+    escritas, pendentes = 0, len(processos)
+    while pendentes:
+        if cancelado and cancelado() and not evento.is_set():
+            evento.set()
+        try:
+            tipo, dado = fila.get(timeout=0.2)
+        except queue.Empty:
+            # Um processo pode morrer sem conseguir avisar (falta de memória,
+            # por exemplo). Sem esta checagem o laço esperaria para sempre.
+            vivos = sum(1 for p in processos if p.is_alive())
+            if vivos == 0 and fila.empty():
+                if pendentes:
+                    resumo["erro"] = resumo["erro"] or (
+                        "um processo de gravação terminou sem responder")
+                break
+            continue
+        if tipo == "prog":
+            escritas += dado
+            if progresso and total_linhas:
+                progresso(min(escritas / total_linhas, 1.0),
+                          f"Gravando ({escritas:,} linhas)".replace(",", "."))
+        elif tipo == "log":
+            log(dado)
+        elif tipo == "ok":
+            resumo["celulas"] += dado["celulas"]
+            resumo["troca"]["do_da"] += dado["troca"]["do_da"]
+            resumo["troca"]["mantidas"] += dado["troca"]["mantidas"]
+            resumo["troca"]["sem_da"] |= dado["troca"]["sem_da"]
+            pendentes -= 1
+        elif tipo == "cancelado":
+            resumo["cancelado"] = True
+            pendentes -= 1
+        elif tipo == "erro":
+            resumo["erro"] = dado
+            evento.set()
+            pendentes -= 1
+
+    for p in processos:
+        p.join(timeout=60)
+        if p.is_alive():
+            p.terminate()
+    return resumo
+
+
+# =============================================================================
 # MOTOR REUTILIZÁVEL
 # =============================================================================
 
 def consolidar(entradas=(), dw=(), da=(), saida=".",
-               prefixo="bps_dw_da__Classe_", sufixo="",
+               prefixo="DA-DW Classe ", sufixo="",
                ano_min=None, ano_max=None,
-               salvar_duplicatas=False, dedup_interno_da=False,
+               salvar_duplicatas=False, dedup_interno_da=False, processos=1,
+               descricao_do_da=True,
                log=print, progresso=None, cancelado=None) -> dict:
     """Consolida DW + DA e devolve um resumo do que foi feito.
 
-    É o mesmo motor usado pela linha de comando; os três callbacks existem para
-    a interface gráfica:
-        log(msg)                       -> uma linha de texto para o usuário
-        progresso(fracao, rotulo)      -> fracao entre 0.0 e 1.0
-        cancelado() -> bool            -> True interrompe (levanta Cancelado)
+    Com descricao_do_da=True, a descrição de cada linha do DW é trocada pelo
+    descritivo que o DA usa para o mesmo CATMAT (o DA é lido depois do DW na
+    1ª passada, então o mapa já está completo quando a 2ª passada grava o DW).
+
+    São duas passadas pelos arquivos de entrada. A primeira só conta (e monta
+    o índice de chaves, a quarentena e a auditoria de duplicatas); a segunda
+    grava. A contagem é necessária porque cada classe vira UMA pasta de
+    trabalho com exatamente as abas DW e DA, e o excedente vai para "Parte 2",
+    "Parte 3" — cortando em fronteira de ano. Como as linhas não chegam em
+    ordem de ano, não há como decidir o corte sem contar antes. A releitura
+    custa pouco: ler e transformar é ~8% do tempo, gravar o xlsx é ~92%.
+
+    Os três callbacks existem para a interface gráfica:
+        log(msg)                   -> uma linha de texto para o usuário
+        progresso(fracao, rotulo)  -> fracao entre 0.0 e 1.0
+        cancelado() -> bool        -> True interrompe (levanta Cancelado)
     """
     dir_saida = Path(saida)
     dir_saida.mkdir(parents=True, exist_ok=True)
@@ -3913,6 +5083,8 @@ def consolidar(entradas=(), dw=(), da=(), saida=".",
         "estatisticas": {}, "gerados": {}, "pasta_saida": str(dir_saida),
         "totais": {"dw": 0, "da_lidas": 0, "da_dup": 0, "da_mantidas": 0},
         "quarentena": 0, "arquivo_quarentena": None, "arquivo_duplicatas": None,
+        "celulas_higienizadas": 0, "arquivos": 0, "partes": {},
+        "catmat_prefixos": {}, "descricao_dw": None,
         "modalidades_desconhecidas": [], "relatorio": None,
     }
 
@@ -3920,16 +5092,23 @@ def consolidar(entradas=(), dw=(), da=(), saida=".",
         log("Nenhum arquivo .csv/.xlsx encontrado nas entradas informadas.")
         return resultado
 
-    # ── Fatias da barra de progresso: ler DW, ler DA, gravar planilhas ────────
     def _fracao(base, peso):
         def _cb(feito, total, rotulo=""):
             if progresso:
                 progresso(base + peso * (feito / total if total else 1), rotulo)
         return _cb
 
-    saidas, estatisticas, chaves_dw = {}, {}, set()
+    saidas = {}                       # {(classe, indice_parte): SaidaParte}
+    estatisticas, chaves_dw, contagens = {}, set(), {}
+    pular_da = {}                     # {arquivo: linhas do DA a descartar}
+    descricoes_da = {} if descricao_do_da else None   # {catmat: (data, texto)}
+    mapa_desc = None                  # {catmat: texto}, montado após a 1ª passada
+    troca_desc = _troca_vazia()
     modalidades_desconhecidas = set()
     quarentena = Quarentena(dir_saida / "linhas_em_quarentena.csv")
+    SaidaParte.celulas_higienizadas = 0
+    _CATMAT_PREFIXOS.clear()
+    prefixos_catmat = {}
     arq_dup = escritor_dup = None
 
     try:
@@ -3958,11 +5137,19 @@ def consolidar(entradas=(), dw=(), da=(), saida=".",
         resultado["arquivos_da"] = len(arquivos_da)
         resultado["ignorados"] = [a.name for a in ignorados]
 
-        log("\n[1/3] Lendo o DW e montando o índice de chaves...")
-        processar_dw(arquivos_dw, saidas, estatisticas, chaves_dw, ano_min,
-                     ano_max, quarentena, log=log, cancelado=cancelado,
-                     progresso=_fracao(0.0, 0.45))
+        # ── 1ª passada: contar ───────────────────────────────────────────────
+        log("\n[1/4] Lendo o DW e montando o índice de chaves...")
+        processar_dw(arquivos_dw, estatisticas, chaves_dw, ano_min, ano_max,
+                     quarentena, modo="contar", contagens=contagens, log=log,
+                     cancelado=cancelado, progresso=_fracao(0.00, 0.05))
         log(f"  -> {len(chaves_dw):,} chaves únicas no DW".replace(",", "."))
+        prefixos_catmat = dict(_CATMAT_PREFIXOS)
+        if prefixos_catmat:
+            detalhe = " | ".join(f"{pre} ({n:,} linhas)".replace(",", ".")
+                                 for pre, n in sorted(prefixos_catmat.items(),
+                                                      key=lambda kv: -kv[1]))
+            log(f"  CATMAT do DW com dígitos a mais à esquerda, mantidos os "
+                f"{TAM_CATMAT} da direita: {detalhe}")
 
         if salvar_duplicatas:
             arq_dup = open(dir_saida / "duplicatas_removidas.csv", "w",
@@ -3972,42 +5159,147 @@ def consolidar(entradas=(), dw=(), da=(), saida=".",
                                    "Catmat", "dataCompra", "nomeFornecedor",
                                    "precoUnitario"])
 
-        log("\n[2/3] Lendo o DA e removendo as duplicatas...")
-        processar_da(arquivos_da, saidas, estatisticas, chaves_dw, ano_min,
-                     ano_max, dedup_interno_da, escritor_dup,
-                     modalidades_desconhecidas, quarentena, log=log,
-                     cancelado=cancelado, progresso=_fracao(0.45, 0.40))
+        log("\n[2/4] Lendo o DA e removendo as duplicatas...")
+        processar_da(arquivos_da, estatisticas, chaves_dw, ano_min, ano_max,
+                     dedup_interno_da, escritor_dup, modalidades_desconhecidas,
+                     quarentena, modo="contar", contagens=contagens, log=log,
+                     pular_registro=pular_da, descricoes=descricoes_da,
+                     cancelado=cancelado, progresso=_fracao(0.05, 0.05))
+        if arq_dup:
+            arq_dup.close(); arq_dup = None
+        quarentena.fechar()
+        if descricoes_da is not None:
+            mapa_desc = {cod: texto for cod, (_data, texto) in descricoes_da.items()}
+            descricoes_da.clear()
+            log(f"  -> {len(mapa_desc):,} CATMATs com descritivo no DA "
+                f"(usado também na aba DW)".replace(",", "."))
+
+        if not contagens:
+            log("\n⚠ Nenhuma linha válida sobrou para gravar.")
+            resultado["estatisticas"] = estatisticas
+            resultado["quarentena"] = quarentena.total
+            resultado["arquivo_quarentena"] = (quarentena.caminho.name
+                                               if quarentena.total else None)
+            return resultado
+
+        # ── Plano das partes ─────────────────────────────────────────────────
+        log("\n[3/4] Planejando os arquivos...")
+        plano, rotas = planejar_partes(contagens, prefixo, sufixo, log=log)
+        n_arquivos = sum(len(p) for p in plano.values())
+        for classe, partes in plano.items():
+            if len(partes) > 1:
+                log(f"  Classe {classe}: {len(partes)} arquivos "
+                    + " | ".join(f"Parte {p['parte']}: "
+                                 f"{_rotulo_ano(p['anos'][0])}–{_rotulo_ano(p['anos'][-1])}"
+                                 for p in partes))
+        log(f"  {n_arquivos} arquivo(s) a gravar, "
+            f"{len(plano)} classe(s).")
+
+        # O índice de chaves já cumpriu seu papel: as duplicatas viraram lista
+        # de linhas a pular. Liberá-lo aqui devolve centenas de MB justamente
+        # antes da fase pesada — e é o que permite gravar em outros processos.
+        chaves_dw.clear()
+
+        total_linhas = sum(p["dw"] + p["da"]
+                           for partes in plano.values() for p in partes)
+        n_proc = min(max(1, int(processos or 1)), len(plano))
+
+        log("\n[4/4] Gravando as planilhas...")
+        usar_sequencial = n_proc <= 1
+        if n_proc > 1:
+            log(f"  {n_proc} processos em paralelo "
+                f"({len(plano)} classe(s) a distribuir)")
+            try:
+                resumo = gravar_em_paralelo(
+                    plano, rotas, arquivos_dw, arquivos_da, dir_saida,
+                    ano_min, ano_max, pular_da, n_proc, total_linhas,
+                    log=log, progresso=(lambda f, r="": progresso(0.10 + 0.75 * f, r))
+                    if progresso else None, cancelado=cancelado,
+                    descricoes=mapa_desc)
+            except Exception as e:                 # não conseguiu nem iniciar
+                resumo = {"celulas": 0, "cancelado": False,
+                          "erro": f"{type(e).__name__}: {e}", "troca": _troca_vazia()}
+            if resumo["cancelado"]:
+                raise Cancelado()
+            if resumo["erro"]:
+                # A 1ª passada pode ter levado dezenas de minutos; jogá-la fora
+                # por causa do multiprocessing seria cruel. Refaz sequencial.
+                log(f"  ⚠ A gravação em paralelo falhou ({resumo['erro']}).")
+                log("    Refazendo em um processo só — vai demorar mais, mas o "
+                    "resultado é o mesmo.")
+                for partes in plano.values():
+                    for pt in partes:
+                        alvo = dir_saida / pt["nome"]
+                        if alvo.exists():
+                            try:
+                                alvo.unlink()
+                            except OSError:
+                                pass
+                usar_sequencial = True
+            else:
+                SaidaParte.celulas_higienizadas += resumo["celulas"]
+                troca_desc = resumo["troca"]
+        if usar_sequencial:
+            for classe, partes in plano.items():
+                for i, pt in enumerate(partes):
+                    saidas[(classe, i)] = SaidaParte(dir_saida / pt["nome"],
+                                                     {"dw": pt["dw"], "da": pt["da"]})
+            roteador = Roteador(rotas, saidas)
+            processar_dw(arquivos_dw, estatisticas, None, ano_min, ano_max,
+                         None, modo="gravar", roteador=roteador, log=log,
+                         verbose=False, cancelado=cancelado,
+                         progresso=_fracao(0.10, 0.45),
+                         descricoes=mapa_desc, troca_desc=troca_desc)
+            processar_da(arquivos_da, estatisticas, None, ano_min, ano_max,
+                         False, None, modalidades_desconhecidas,
+                         None, modo="gravar", roteador=roteador, log=log,
+                         verbose=False, pular=pular_da, cancelado=cancelado,
+                         progresso=_fracao(0.55, 0.30))
     except Cancelado:
         resultado["cancelado"] = True
-        for saida_classe in saidas.values():
-            saida_classe.descartar()
+        for parte in saidas.values():
+            parte.descartar()
         saidas.clear()
-        log("\n🛑 Consolidação cancelada — nenhuma planilha foi gravada.")
-        return resultado
-    finally:
         if arq_dup:
             arq_dup.close()
         quarentena.fechar()
+        log("\n🛑 Consolidação cancelada — nenhuma planilha foi gravada.")
+        return resultado
 
-    log("\n[3/3] Gravando as planilhas...")
-    gerados = {}
-    classes = sorted(saidas)
-    for i, classe in enumerate(classes, start=1):
-        nome = f"{prefixo}{classe}{sufixo}.xlsx"
-        saidas[classe].salvar(dir_saida / nome)
-        gerados[classe] = nome
-        e = _est(estatisticas, classe)
-        log(f"  {nome}: dw={e['dw']:,} | da={e['da_mantidas']:,} "
-            f"(removidas {e['da_dup']:,})".replace(",", "."))
+    # ── Fechamento (é aqui que o .xlsx é de fato montado no disco) ───────────
+    # No caminho paralelo cada processo já fechou as suas; aqui `saidas` está
+    # vazio e só o plano descreve o que foi gravado.
+    total_partes = len(saidas)
+    for i, (_chave, parte) in enumerate(sorted(saidas.items()), start=1):
+        parte.fechar()
         if progresso:
-            progresso(0.85 + 0.15 * (i / len(classes)), f"Gravando {nome}")
+            progresso(0.85 + 0.14 * (i / total_partes),
+                      f"Fechando {parte.caminho.name}")
+    gerados = {classe: [p["nome"] for p in partes]
+               for classe, partes in plano.items()}
+    for classe, partes in plano.items():
+        for p in partes:
+            log(f"  {p['nome']}: dw={p['dw']:,} | da={p['da']:,} "
+                f"| anos {_rotulo_ano(p['anos'][0])}–{_rotulo_ano(p['anos'][-1])}"
+                .replace(",", "."))
+    descricao_dw = None
+    if mapa_desc is not None:
+        descricao_dw = {"do_da": troca_desc["do_da"], "mantidas": troca_desc["mantidas"],
+                        "catmats_sem_da": len(troca_desc["sem_da"])}
+        log(f"  Descrição do DW: {descricao_dw['do_da']:,} linha(s) com o descritivo "
+            f"do DA | {descricao_dw['mantidas']:,} mantida(s) do DW "
+            f"({descricao_dw['catmats_sem_da']:,} CATMAT(s) sem compra no DA)"
+            .replace(",", "."))
 
     nome_relatorio = "Relatorio_Consolidacao.xlsx"
-    gravar_relatorio(dir_saida / nome_relatorio, estatisticas, gerados)
+    gravar_relatorio(dir_saida / nome_relatorio, estatisticas,
+                     {c: " | ".join(n) for c, n in gerados.items()})
 
     resultado.update({
         "estatisticas": estatisticas,
-        "gerados": gerados,
+        "gerados": {c: " | ".join(n) for c, n in gerados.items()},
+        "partes": {c: [p["nome"] for p in ps] for c, ps in plano.items()},
+        "arquivos": sum(len(v) for v in gerados.values()),
         "relatorio": nome_relatorio,
         "totais": {
             "dw":          sum(e["dw"] for e in estatisticas.values()),
@@ -4018,6 +5310,9 @@ def consolidar(entradas=(), dw=(), da=(), saida=".",
         "quarentena": quarentena.total,
         "arquivo_quarentena": quarentena.caminho.name if quarentena.total else None,
         "arquivo_duplicatas": "duplicatas_removidas.csv" if salvar_duplicatas else None,
+        "celulas_higienizadas": SaidaParte.celulas_higienizadas,
+        "catmat_prefixos": prefixos_catmat,
+        "descricao_dw": descricao_dw,
         "modalidades_desconhecidas": sorted(modalidades_desconhecidas),
     })
     if progresso:
@@ -4050,9 +5345,12 @@ def _cli_consolidacao():
                     help="também remove repetições da mesma chave dentro do próprio DA "
                          "(atenção: costumam ser registros distintos, de fornecedores "
                          "e preços diferentes)")
+    ap.add_argument("--processos", type=int, default=1,
+                    help="processos paralelos na gravação (1 = sequencial)")
     args = ap.parse_args()
 
     r = consolidar(entradas=args.entrada, dw=args.dw, da=args.da,
+                   processos=args.processos,
                    saida=args.saida, prefixo=args.prefixo, sufixo=args.sufixo,
                    ano_min=args.ano_min, ano_max=args.ano_max,
                    salvar_duplicatas=args.salvar_duplicatas,
@@ -4067,11 +5365,23 @@ def _cli_consolidacao():
     print(f"DA lido (linhas válidas) ....... {t['da_lidas']:,}".replace(",", "."))
     print(f"DA removido (já estava no DW) .. {t['da_dup']:,}".replace(",", "."))
     print(f"DA mantido ..................... {t['da_mantidas']:,}".replace(",", "."))
+    if r["descricao_dw"]:
+        d = r["descricao_dw"]
+        print(f"DW com descritivo do DA ........ {d['do_da']:,}".replace(",", "."))
+        print(f"DW com descrição própria ....... {d['mantidas']:,} "
+              f"({d['catmats_sem_da']:,} CATMATs sem compra no DA)".replace(",", "."))
     print(f"Relatório ...................... {r['relatorio']}")
     if r["quarentena"]:
         print(f"\n! {r['quarentena']:,} linha(s) corrompida(s) não entraram nas planilhas."
               .replace(",", "."))
         print(f"  Conteúdo preservado em: {r['arquivo_quarentena']}")
+    if r["catmat_prefixos"]:
+        print("\n! CATMAT do DW com dígitos a mais à esquerda: "
+              + " | ".join(f"{k} ({v:,})".replace(",", ".")
+                           for k, v in r["catmat_prefixos"].items()))
+    if r["celulas_higienizadas"]:
+        print(f"\n! {r['celulas_higienizadas']:,} célula(s) com caracteres de controle "
+              f"foram higienizadas.".replace(",", "."))
     if r["modalidades_desconhecidas"]:
         print(f"\n! Códigos de modalidade não mapeados: "
               f"{', '.join(r['modalidades_desconhecidas'])}"
@@ -4082,6 +5392,10 @@ def _cli_consolidacao():
 
 # =============================================================================
 if __name__ == "__main__":
+    # PRECISA ser a primeira coisa: no Windows os processos filhos reexecutam o
+    # programa, e sem isto um .exe congelado abriria uma janela nova a cada
+    # processo, sem parar.
+    multiprocessing.freeze_support()
     # Com argumentos, roda a consolidação em linha de comando; sem eles,
     # abre a interface. Ex.: python ExtratorCatmat.py -e ENTRADA -s SAIDA
     if len(sys.argv) > 1:
