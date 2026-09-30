@@ -3,8 +3,12 @@ Extrator Compras.gov  —  só a extração que conecta no Compras.gov, sem inte
 
 Isolado do ExtratorCatmat.py: é o mesmo motor que baixa os Registros de Preço do
 Portal de Compras Governamentais (dadosabertos.compras.gov.br), sem a interface
-CustomTkinter, sem o BPS e sem a consolidação DW + DA. Precisa apenas de
+CustomTkinter, sem a aba BPS e sem a consolidação DW + DA. Precisa apenas de
 requests, pandas e openpyxl.
+
+Como no ExtratorCatmat (opção "Usar a descrição do BPS", marcada por padrão), o
+descricaoItem de cada registro é trocado pela descrição do mesmo CATMAT no BPS
+(apidadosabertos.saude.gov.br). --sem-descricao-bps desliga a troca.
 
     Classe -> PDMs -> CATMATs -> Registros de Preço
 
@@ -777,6 +781,155 @@ def catmats_dos_pdms(pdms) -> List[int]:
 
 
 # =============================================================================
+# DESCRIÇÃO DO BPS  —  troca o descricaoItem do Compras.gov pelo texto do BPS
+# -----------------------------------------------------------------------------
+# GET /economia-da-saude/bps?codigoCatmat=...&pagina=1&tamanhoPagina=1
+# API de Dados Abertos do Ministério da Saúde: outro servidor, fora da cota do
+# Compras.gov. Uma chamada leve por CATMAT, sem filtro de data — basta um
+# registro de qualquer compra para ter a descrição. CATMAT nunca comprado no
+# BPS fica com o texto do Compras.gov. É o mesmo caminho do ExtratorCatmat com
+# "Usar a descrição do BPS" marcado e a fonte BPS desmarcada.
+# =============================================================================
+
+URL_BPS = "https://apidadosabertos.saude.gov.br/economia-da-saude/bps"
+_pool_bps = ThreadPoolExecutor(max_workers=4, thread_name_prefix="bps")
+# Descrição do BPS por CATMAT ("" = CATMAT sem nenhuma compra no BPS)
+_cache_desc_bps: dict = {}
+_cache_desc_lock = threading.Lock()
+
+# ── Limpeza da descrição: ESPELHO do bloco ds_catmat do extracao_bps.sql ────
+# Mesmas regras, na mesma ordem, para que a descrição que o extrator grava
+# seja idêntica à da extração SQL. Mudou uma regra lá? Mude aqui também (e no
+# ExtratorCatmat.py).
+_TAGS_BPS = re.compile(r"</?(div|span|p|br|b|i|strong|em)[^>]*>", re.IGNORECASE)
+_ENTIDADES_BPS = (
+    ("&#193;", "Á"), ("&#194;", "Â"), ("&#195;", "Ã"), ("&#199;", "Ç"),
+    ("&#201;", "É"), ("&#202;", "Ê"), ("&#205;", "Í"), ("&#211;", "Ó"),
+    ("&#212;", "Ô"), ("&#213;", "Õ"), ("&#218;", "Ú"), ("&#220;", "Ü"),
+    ("&#225;", "á"), ("&#226;", "â"), ("&#227;", "ã"), ("&#231;", "ç"),
+    ("&#233;", "é"), ("&#234;", "ê"), ("&#237;", "í"), ("&#243;", "ó"),
+    ("&#244;", "ô"), ("&#245;", "õ"), ("&#250;", "ú"), ("&#252;", "ü"),
+    ("&#186;", "º"), ("&#170;", "ª"),
+)
+_ESP = r"[ \t\n\r\f\v]"            # o [[:space:]] do PostgreSQL
+_RE_DOIS_PONTOS_BPS = re.compile(_ESP + r"*:" + _ESP + r"*")
+_RE_ESP_VIRGULA_BPS = re.compile(_ESP + r"+,")
+_RE_ESPACOS_BPS     = re.compile(_ESP + r"+")
+
+
+def limpar_descricao_bps(texto) -> str:
+    """Descrição do BPS limpa exatamente como o extracao_bps.sql limpa."""
+    if not texto:
+        return ""
+    s = _TAGS_BPS.sub("", str(texto))
+    for entidade, caractere in _ENTIDADES_BPS:
+        s = s.replace(entidade, caractere)
+    s = s.replace("¿", "°").replace("*", "")
+    s = _RE_DOIS_PONTOS_BPS.sub(": ", s)
+    s = _RE_ESP_VIRGULA_BPS.sub(",", s)
+    s = _RE_ESPACOS_BPS.sub(" ", s)
+    return s.strip(" ")
+
+
+def _cod_bps(valor) -> str:
+    """CATMAT como chave: só dígitos, sem zeros à esquerda."""
+    s = str(valor if valor is not None else "").strip()
+    return (s.lstrip("0") or "0") if s.isdigit() else ""
+
+
+def _get_bps(params, tentativas=4):
+    """Uma página da API do BPS. Devolve (lista, erro); lista=None se falhou."""
+    ultimo = ""
+    for t in range(tentativas):
+        if _cancelado:
+            return None, "cancelado"
+        try:
+            r = _http.get(URL_BPS, params=params, timeout=TIMEOUT)
+            if r.status_code == 429 or r.status_code >= 500:
+                ultimo = f"HTTP {r.status_code}"
+                _dormir(15 * (t + 1) if r.status_code == 429 else 3 * (t + 1))
+                continue
+            r.raise_for_status()
+            return r.json().get("bps") or [], None
+        except (requests.exceptions.RequestException, ValueError, AttributeError) as e:
+            ultimo = f"{type(e).__name__}: {e}"
+            _dormir(3 * (t + 1))
+    return None, ultimo
+
+
+def _descricao_bps(codigo):
+    """Descrição de um CATMAT no BPS: basta um registro de qualquer data.
+    None = o BPS não respondeu; "" = CATMAT nunca comprado no BPS."""
+    lote, _ = _get_bps({"codigoCatmat": _cod_bps(codigo), "pagina": 1,
+                        "tamanhoPagina": 1})
+    if lote is None:
+        return None
+    return limpar_descricao_bps(lote[0].get("descricaoItem")) if lote else ""
+
+
+def aplicar_descricao_bps(dfs_e_meta) -> dict:
+    """Troca, nas páginas de um código, o descricaoItem do Compras.gov pela
+    descrição do BPS do mesmo CATMAT (coluna codigoItemCatalogo — na busca por
+    PDM cada registro traz o seu). Cada CATMAT é consultado uma vez por
+    execução; falha não entra no cache e é tentada de novo se o CATMAT voltar.
+
+    Devolve {"trocadas": linhas com o texto trocado,
+             "sem_bps": CATMATs nunca comprados no BPS (texto do Compras.gov),
+             "falhas":  CATMATs que o BPS não respondeu (texto do Compras.gov)}
+    """
+    usados = set()
+    for df, _m, _p in dfs_e_meta:
+        if "codigoItemCatalogo" in df.columns:
+            usados.update(_cod_bps(c) for c in df["codigoItemCatalogo"])
+    usados.discard("")
+    with _cache_desc_lock:
+        faltam = [c for c in usados if c not in _cache_desc_bps]
+    futuros = [(c, _pool_bps.submit(_descricao_bps, c)) for c in faltam]
+    falhas = []
+    for c, fut in futuros:
+        desc = fut.result()
+        if desc is None:
+            falhas.append(c)
+            continue
+        with _cache_desc_lock:
+            _cache_desc_bps[c] = desc
+    with _cache_desc_lock:
+        mapa = {c: _cache_desc_bps.get(c, "") for c in usados}
+    sem_bps = sorted((c for c, d in mapa.items() if not d and c not in falhas), key=int)
+    mapa = {c: d for c, d in mapa.items() if d}
+
+    trocadas = 0
+    for df, _m, _p in dfs_e_meta:
+        if not mapa or "codigoItemCatalogo" not in df.columns \
+                or "descricaoItem" not in df.columns:
+            continue
+        novo = df["codigoItemCatalogo"].map(_cod_bps).map(mapa)
+        trocar = novo.notna() & (novo != df["descricaoItem"])
+        if trocar.any():
+            df.loc[trocar, "descricaoItem"] = novo[trocar]
+            trocadas += int(trocar.sum())
+    return {"trocadas": trocadas, "sem_bps": sem_bps, "falhas": sorted(falhas, key=int)}
+
+
+def extrair_codigo_bps(codigo, tipo=TIPO_CATMAT, d_ini=None, d_fim=None,
+                       pasta_corr=None, descricao_bps=True):
+    """extrair_codigo + a troca da descrição pelo texto do BPS, na thread do
+    worker — a consulta ao BPS corre em paralelo com os outros códigos.
+    Devolve a 5-tupla de extrair_codigo + o resumo do BPS (None quando a
+    troca está desligada ou o código não trouxe registros)."""
+    res = extrair_codigo(codigo, tipo, d_ini, d_fim, pasta_corr)
+    if not descricao_bps or res[2] != "ok":
+        return res + (None,)
+    try:
+        bps = aplicar_descricao_bps(res[1])
+    except Exception as e:                  # BPS nunca derruba a extração do Compras.gov
+        _log(f"{ROTULO_TIPO[tipo]} {codigo}: descrição do BPS não aplicada "
+             f"({type(e).__name__}: {e}) — ficou o texto do Compras.gov.")
+        bps = {"trocadas": 0, "sem_bps": [], "falhas": ["(erro interno)"]}
+    return res + (bps,)
+
+
+# =============================================================================
 # GRAVAÇÃO  —  .xlsx em streaming ou .csv em append, com rollover a cada 1 mi
 # =============================================================================
 
@@ -1013,12 +1166,14 @@ class Resultado:
         self.vazios      = 0
         self.processados = set()
         self.erros       = set()    # erro de API ainda sem sucesso
+        self.descricao_bps = False
+        self.bps         = {}       # código -> resumo de aplicar_descricao_bps
 
     @property
     def total(self):
         return sum(self.baixados.values())
 
-    def registrar(self, codigo, dfs_e_meta, reg_esp, perdas):
+    def registrar(self, codigo, dfs_e_meta, reg_esp, perdas, bps=None):
         self.processados.add(codigo); self.erros.discard(codigo)
         self.esperados[codigo] = reg_esp
         self.baixados[codigo]  = sum(len(df) for df, _, _ in dfs_e_meta)
@@ -1027,16 +1182,33 @@ class Resultado:
         self.reparadas += sum(1 for _, marca, _ in dfs_e_meta if marca == "reparada")
         if not dfs_e_meta:
             self.vazios += 1
+        if bps is not None:
+            self.bps[codigo] = bps
+
+    def status_bps(self, codigo) -> str:
+        """Coluna 'descricao BPS' do relatório de integridade."""
+        b = self.bps.get(codigo)
+        if b is None:
+            return ""
+        partes = []
+        if b["falhas"]:
+            partes.append("ERRO: BPS sem resposta p/ " + ", ".join(b["falhas"]))
+        if b["sem_bps"]:
+            partes.append("sem compra no BPS: " + ", ".join(b["sem_bps"]))
+        return " | ".join(partes) + " (texto do Compras.gov)" if partes else "OK"
 
 
-def extrair(codigos, tipo, d_ini, d_fim, destino, pasta_corr=None) -> Resultado:
+def extrair(codigos, tipo, d_ini, d_fim, destino, pasta_corr=None,
+            descricao_bps=True) -> Resultado:
     """
     Extrai os Registros de Preço de uma lista de códigos (CATMATs ou PDMs) e
     grava cada página em `destino`. Paralelo até WORKERS_COMPRAS: quem limita o
     ritmo é a cota. Códigos com erro de API voltam numa fila de retry
     (15 s → 30 s). A gravação acontece só nesta thread.
+    descricao_bps: troca o descricaoItem pelo texto do BPS antes de gravar.
     """
     res       = Resultado(codigos, tipo)
+    res.descricao_bps = descricao_bps
     rotulo    = ROTULO_TIPO[tipo]
     n         = len(res.codigos)
     pendentes = list(res.codigos)
@@ -1048,10 +1220,11 @@ def extrair(codigos, tipo, d_ini, d_fim, destino, pasta_corr=None) -> Resultado:
             _dormir(espera)
         erros = []
         with ThreadPoolExecutor(max_workers=WORKERS_COMPRAS) as executor:
-            futuros = [executor.submit(extrair_codigo, c, tipo, d_ini, d_fim, pasta_corr)
+            futuros = [executor.submit(extrair_codigo_bps, c, tipo, d_ini, d_fim,
+                                       pasta_corr, descricao_bps)
                        for c in pendentes]
             for fut in _concluidos(futuros):
-                codigo, dfs_e_meta, status, reg_esp, perdas = fut.result()
+                codigo, dfs_e_meta, status, reg_esp, perdas, bps = fut.result()
                 if status == "cancelado":
                     continue
                 if status == "erro":
@@ -1060,18 +1233,23 @@ def extrair(codigos, tipo, d_ini, d_fim, destino, pasta_corr=None) -> Resultado:
                     continue
                 for df_proc, _, _ in dfs_e_meta:
                     destino.gravar(codigo, df_proc)
-                res.registrar(codigo, dfs_e_meta, reg_esp, perdas)
+                res.registrar(codigo, dfs_e_meta, reg_esp, perdas, bps)
 
                 bx  = res.baixados[codigo]
                 txt = f"[{len(res.processados)}/{n}] {rotulo} {codigo}: {_milhar(bx)} registros"
                 if bx != reg_esp:
                     txt += f" de {_milhar(reg_esp)} esperados"
+                if bps is not None:
+                    txt += f" | descrição do BPS em {_milhar(bps['trocadas'])} linha(s)"
                 _log(txt + ".")
                 for _, marca, pag in dfs_e_meta:
                     if marca == "reparada":
                         _log(f"    pág {pag}: reparada (íntegra).")
                 for pag in perdas:
                     _log(f"    pág {pag}: registros perdidos.")
+                if bps is not None and bps["falhas"]:
+                    _log("    BPS sem resposta para o(s) CATMAT(s) "
+                         + ", ".join(bps["falhas"]) + " — ficou o texto do Compras.gov.")
             if _cancelado:
                 _log("Cancelando: aguardando as requisições em andamento...")
                 executor.shutdown(cancel_futures=True)
@@ -1083,9 +1261,11 @@ def extrair(codigos, tipo, d_ini, d_fim, destino, pasta_corr=None) -> Resultado:
 
 
 def gravar_relatorio(caminho, res: Resultado, aba="Relatorio Integridade"):
-    """Uma linha por código: esperados x baixados, páginas com perda e status."""
+    """Uma linha por código: esperados x baixados, páginas com perda e status
+    (+ a origem da descrição, quando a troca pelo texto do BPS está ligada)."""
     wb = Workbook(); ws = wb.active; ws.title = aba[:31]
-    ws.append([res.tipo, "esperados", "baixados", "paginas", "status"])
+    ws.append([res.tipo, "esperados", "baixados", "paginas", "status"]
+              + (["descricao BPS"] if res.descricao_bps else []))
     for c in res.codigos:
         bx = int(res.baixados.get(c, 0))
         ex = int(res.esperados.get(c, 0))
@@ -1098,7 +1278,8 @@ def gravar_relatorio(caminho, res: Resultado, aba="Relatorio Integridade"):
             st = "ERRO_API_PERSISTENTE"
         else:
             st = "NAO PROCESSADO (cancelado)"
-        ws.append([c, ex, bx, ", ".join(res.perdas.get(c, [])), st])
+        ws.append([c, ex, bx, ", ".join(res.perdas.get(c, [])), st]
+                  + ([res.status_bps(c)] if res.descricao_bps else []))
     wb.save(caminho)
 
 
@@ -1107,11 +1288,11 @@ def gravar_relatorio(caminho, res: Resultado, aba="Relatorio Integridade"):
 # =============================================================================
 
 def fluxo_codigos(codigos, tipo, d_ini, d_fim, pasta, fmt,
-                  por_classe=False, mapa=None, pasta_corr=None):
+                  por_classe=False, mapa=None, pasta_corr=None, descricao_bps=True):
     """Lista de CATMATs/PDMs → um arquivo (ou um por classe) + relatório."""
     destino = Destino(pasta, fmt, por_classe=por_classe, mapa=mapa)
     try:
-        res = extrair(codigos, tipo, d_ini, d_fim, destino, pasta_corr)
+        res = extrair(codigos, tipo, d_ini, d_fim, destino, pasta_corr, descricao_bps)
     finally:
         arquivos = destino.finalizar()      # salva o que houver, mesmo cancelado
     rel = os.path.join(pasta, "Relatorio_Integridade.xlsx")
@@ -1119,7 +1300,8 @@ def fluxo_codigos(codigos, tipo, d_ini, d_fim, pasta, fmt,
     return [res], arquivos + [rel]
 
 
-def fluxo_classes(classes, tipo, d_ini, d_fim, pasta, fmt, pasta_corr=None):
+def fluxo_classes(classes, tipo, d_ini, d_fim, pasta, fmt, pasta_corr=None,
+                  descricao_bps=True):
     """
     Para cada classe: PDMs → CATMATs → Registros de Preço → classe_XXXX +
     Relatorio_Integridade_XXXX. Com tipo=PDM a expansão PDM → CATMAT é
@@ -1153,7 +1335,7 @@ def fluxo_classes(classes, tipo, d_ini, d_fim, pasta, fmt, pasta_corr=None):
 
         destino = Destino(pasta, fmt, base=f"classe_{classe}")
         try:
-            res = extrair(codigos, tipo, d_ini, d_fim, destino, pasta_corr)
+            res = extrair(codigos, tipo, d_ini, d_fim, destino, pasta_corr, descricao_bps)
         finally:
             gerados = destino.finalizar()
         rel = os.path.join(pasta, f"Relatorio_Integridade_{classe}.xlsx")
@@ -1260,7 +1442,12 @@ def main(argv=None) -> int:
                          "arquivo ou, sem ela, do codigoClasse dos registros")
     ap.add_argument("--corrompidas", metavar="PASTA",
                     help="guarda nesta pasta o CSV bruto das páginas com perda")
+    ap.add_argument("--sem-descricao-bps", action="store_true",
+                    help="mantém o descricaoItem do Compras.gov. Por padrão ele é "
+                         "trocado pela descrição do BPS do mesmo CATMAT, como no "
+                         "ExtratorCatmat com 'Usar a descrição do BPS' marcado")
     args = ap.parse_args(argv)
+    descricao_bps = not args.sem_descricao_bps
 
     if sum(1 for x in (args.arquivo, args.codigos, args.classes) if x) != 1:
         ap.error("informe exatamente uma entrada: ARQUIVO, --codigos ou --classes")
@@ -1300,6 +1487,9 @@ def main(argv=None) -> int:
         fd = lambda s: "-".join(reversed(s.split("-"))) if s else "..."
         _log(f"Período : {fd(d_ini)} a {fd(d_fim)}")
     _log(f"Saída   : {os.path.abspath(pasta)} ({args.formato})")
+    _log("Descrição: " + ("do BPS (descricaoItem trocado pelo texto do BPS; "
+                          "CATMAT sem compra no BPS fica com o do Compras.gov)"
+                          if descricao_bps else "do Compras.gov (--sem-descricao-bps)"))
     if args.por_classe and not args.classes:
         _log("Um arquivo por classe — origem da classe: "
              + (f"coluna '{col_cl}' do arquivo" if mapa else "campo codigoClasse dos registros"))
@@ -1311,11 +1501,12 @@ def main(argv=None) -> int:
     try:
         if args.classes:
             resultados, arquivos = fluxo_classes(classes, tipo, d_ini, d_fim, pasta,
-                                                 args.formato, args.corrompidas)
+                                                 args.formato, args.corrompidas,
+                                                 descricao_bps)
         else:
             resultados, arquivos = fluxo_codigos(codigos, tipo, d_ini, d_fim, pasta,
                                                  args.formato, args.por_classe, mapa,
-                                                 args.corrompidas)
+                                                 args.corrompidas, descricao_bps)
     except KeyboardInterrupt:
         _log("Interrompido.")
         return 130
@@ -1331,6 +1522,17 @@ def main(argv=None) -> int:
     _log(f"Páginas com perda     : {soma(lambda r: sum(len(p) for p in r.perdas.values()))}")
     _log(f"Códigos sem registros : {soma(lambda r: r.vazios)}")
     _log(f"Códigos com erro      : {soma(lambda r: len(r.erros))}")
+    if descricao_bps:
+        resumos = [b for r in resultados for b in r.bps.values()]
+        sem_bps = sorted({c for b in resumos for c in b["sem_bps"]}, key=int)
+        falhas  = sorted({c for b in resumos for c in b["falhas"]})
+        _log(f"Descrição do BPS      : {_milhar(sum(b['trocadas'] for b in resumos))} "
+             f"linha(s) trocada(s); {len(sem_bps)} CATMAT(s) sem compra no BPS "
+             f"(ficou o texto do Compras.gov)")
+        if falhas:
+            _log(f"[ATENÇÃO] BPS sem resposta para {len(falhas)} CATMAT(s) — ficou o "
+                 "texto do Compras.gov: " + ", ".join(falhas[:30])
+                 + (" ..." if len(falhas) > 30 else ""))
     _log(f"Tempo                 : {time.time() - inicio:.0f} s")
     for a in arquivos:
         _log(f"  {a}")

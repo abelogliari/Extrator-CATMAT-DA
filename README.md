@@ -42,7 +42,9 @@ Distribuição em produção: executável gerado com PyInstaller e instalador cr
 
 ## Extração sem interface
 
-`extrator_comprasgov.py` é só a parte que conecta no Compras.gov, isolada do `ExtratorCatmat.py`: o mesmo motor (cota de requisições, parser de CSV, paginação, writers em streaming, relatório de integridade), sem CustomTkinter, sem BPS e sem a consolidação DW + DA. Depende apenas de `requests`, `pandas` e `openpyxl`.
+`extrator_comprasgov.py` é só a parte que conecta no Compras.gov, isolada do `ExtratorCatmat.py`: o mesmo motor (cota de requisições, parser de CSV, paginação, writers em streaming, relatório de integridade), sem CustomTkinter, sem a aba BPS e sem a consolidação DW + DA. Depende apenas de `requests`, `pandas` e `openpyxl`.
+
+Como na interface ("Usar a descrição do BPS", marcada por padrão), o `descricaoItem` de cada registro é trocado pela descrição do mesmo CATMAT no BPS, limpa com as regras do `extracao_bps.sql`. CATMAT sem compra no BPS fica com o texto do Compras.gov. A consulta é uma chamada leve por CATMAT, sem filtro de data. O relatório de integridade ganha a coluna `descricao BPS`, que indica os CATMATs sem compra no BPS e os que o BPS não respondeu. `--sem-descricao-bps` desliga a troca.
 
 ```bash
 python extrator_comprasgov.py codigos.xlsx                    # CATMATs do arquivo
