@@ -135,6 +135,23 @@ A leitura tolera separador de milhar: `\d+` sozinho capturaria apenas o `1` em `
 
 Quando o rodapé de páginas não vem e a última página volta cheia (500 registros), o extrator faz uma requisição extra para confirmar que acabou. Com o rodapé presente, nenhuma requisição a mais é feita.
 
+### Log de erros de API
+
+Todo erro de rede ou de API é registrado com a **fonte** onde aconteceu:
+
+| fonte | onde |
+|---|---|
+| `DA` | Compras.gov, Pesquisa de Preço (registros de preço) |
+| `CATÁLOGO` | Compras.gov, catálogo de materiais (PDMs e CATMATs) |
+| `BPS` | API de Dados Abertos do Ministério da Saúde |
+| `PROGRAMA` | erro interno do extrator, não da API (mostra função e linha) |
+
+Cada ocorrência aparece no log da tela (🔴) com o endpoint, o código, a página, o tipo de erro traduzido (HTTP 400/403/404/429/500/502/503/504, timeout, falha de DNS, conexão recusada/interrompida, erro de SSL/proxy, resposta que não é CSV/JSON) e o trecho da resposta da API. Também é gravada em `Log_Erros_API_<data>.csv`, na pasta de destino ou na pasta do programa, com a URL completa para reproduzir no navegador. O arquivo só é criado se houver erro.
+
+Ao final da extração, a **apuração** agrupa as ocorrências por fonte e tipo, com a quantidade e os códigos afetados, e informa quantas vezes o Compras.gov pediu pausa por limite de requisições (HTTP 429). No relatório de integridade, os códigos com erro saem com o motivo (`ERRO_API_PERSISTENTE — DA: HTTP 503 (...)`) em vez de `OK`.
+
+Uma resposta HTTP 200 que não é o CSV da Pesquisa de Preço, como uma página HTML de manutenção, deixou de ser contada como "0 registros": vira erro e entra no retry.
+
 ### Relatório de integridade
 
 Ao final de cada extração é gerado um `Relatorio_Integridade.xlsx` (ou `Relatorio_Integridade_XXXX.xlsx` por classe) com uma linha por código:

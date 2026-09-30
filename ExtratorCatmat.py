@@ -34,6 +34,7 @@ import xlsxwriter
 import multiprocessing
 from array import array
 import threading
+import traceback
 import math
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import tkinter as tk
@@ -158,8 +159,231 @@ def _get_compras(url, params, timeout=TIMEOUT, max_429=10):
         resp = _http.get(url, params=params, timeout=timeout)
         if resp.status_code != 429:
             return resp
-        _cota_compras.bloquear(_retry_after(resp))
+        espera = _retry_after(resp)
+        _erros_api.contar_429(espera)
+        _cota_compras.bloquear(espera)
     return resp
+
+# =============================================================================
+# REGISTRO DE ERROS DE API  —  apuração: QUAL erro, em QUAL fonte
+# -----------------------------------------------------------------------------
+# Todo erro de rede/API passa por _erros_api.registrar(fonte, diagnosticar(...)):
+#   "DA"        → Compras.gov, Pesquisa de Preço (registros de preço)
+#   "CATÁLOGO"  → Compras.gov, catálogo de materiais (PDMs e CATMATs)
+#   "BPS"       → API de Dados Abertos do Ministério da Saúde
+#   "PROGRAMA"  → erro interno do extrator, NÃO da API (antes aparecia como
+#                 "erro na API", sem pista do que era)
+# Cada ocorrência vai para o log da tela e para Log_Erros_API_<data>.csv (com a
+# URL completa, que pode ser colada no navegador para reproduzir). Ao fim da
+# extração, apurar() agrupa as ocorrências por fonte e tipo de erro.
+# =============================================================================
+
+_HTTP_SIGNIFICADO = {
+    400: "requisição recusada: parâmetro inválido (código, data ou tipo)",
+    401: "não autorizado",
+    403: "acesso negado: bloqueio do servidor, da rede ou do proxy",
+    404: "não encontrado: o endpoint mudou ou o código não existe",
+    408: "o servidor encerrou a requisição por demora",
+    429: "limite de requisições excedido (rate limit)",
+    500: "erro interno no servidor da API",
+    502: "bad gateway: o servidor intermediário não obteve resposta da API",
+    503: "serviço indisponível: API em manutenção ou sobrecarregada",
+    504: "gateway timeout: a API demorou demais para responder",
+}
+
+
+def _trecho(texto, n=300) -> str:
+    return re.sub(r"\s+", " ", str(texto or "")).strip()[:n]
+
+
+def diagnosticar(resp=None, exc=None) -> dict:
+    """Traduz uma resposta HTTP de erro ou uma exceção em
+    {"tipo", "http", "detalhe", "resposta", "url", "conexao"}.
+    conexao=True quando não houve comunicação com o servidor (queda de rede)."""
+    if resp is not None:
+        st = resp.status_code
+        try:
+            corpo = resp.text
+        except Exception:
+            corpo = ""
+        return {"tipo": f"HTTP {st}", "http": st,
+                "detalhe": _HTTP_SIGNIFICADO.get(st) or
+                           ("erro no servidor da API" if st >= 500 else "resposta de erro"),
+                "resposta": _trecho(corpo), "url": getattr(resp, "url", ""),
+                "conexao": False}
+
+    E = requests.exceptions
+    resp_exc = getattr(exc, "response", None)
+    if isinstance(exc, E.HTTPError) and resp_exc is not None:
+        return diagnosticar(resp=resp_exc)
+    req = getattr(exc, "request", None)
+    url = getattr(req, "url", "") or ""
+    msg = str(exc)
+    baixo = msg.lower()
+    conexao = isinstance(exc, E.ConnectionError)
+    if isinstance(exc, E.ConnectTimeout):
+        tipo, det = "Timeout de conexão", ("o servidor não aceitou a conexão a tempo "
+                                           "(fora do ar, rede lenta ou bloqueio)")
+    elif isinstance(exc, E.ReadTimeout):
+        tipo, det = "Timeout de leitura", f"conectou, mas a API não respondeu em {TIMEOUT} s"
+    elif isinstance(exc, E.SSLError):
+        tipo, det = "Erro SSL/TLS", "falha no certificado ou na conexão segura (proxy corporativo?)"
+    elif isinstance(exc, E.ProxyError):
+        tipo, det = "Erro de proxy", "o proxy da rede recusou ou não alcançou o servidor"
+    elif isinstance(exc, E.ConnectionError):
+        if any(s in baixo for s in ("nameresolution", "getaddrinfo", "name or service",
+                                    "nodename", "failed to resolve", "no address")):
+            tipo, det = "Falha de DNS", "o nome do servidor não foi resolvido (sem internet ou DNS bloqueado)"
+        elif "refused" in baixo or "recusad" in baixo or "10061" in baixo:
+            tipo, det = "Conexão recusada", "o servidor (ou firewall) recusou a conexão"
+        elif any(s in baixo for s in ("reset", "aborted", "remotedisconnected",
+                                      "connection broken", "10054")):
+            tipo, det = "Conexão interrompida", "a conexão caiu no meio da resposta"
+        else:
+            tipo, det = "Erro de conexão", "sem comunicação com o servidor"
+    elif isinstance(exc, ValueError):        # inclui o JSONDecodeError do requests
+        tipo, det = "Resposta inválida", "a API respondeu com conteúdo que não é JSON válido"
+    elif isinstance(exc, E.RequestException):
+        tipo, det = "Erro de requisição", type(exc).__name__
+    else:
+        # Não é a API: é um erro no próprio extrator. Aponta função e linha.
+        onde = ""
+        try:
+            quadros = traceback.extract_tb(exc.__traceback__)
+            nossos = [q for q in quadros
+                      if os.path.basename(q.filename) == os.path.basename(__file__)]
+            quadro = (nossos or quadros)[-1]
+            onde = f" em {quadro.name}(), linha {quadro.lineno}"
+        except Exception:
+            pass
+        tipo, det = "Erro interno do programa", f"{type(exc).__name__}{onde}"
+    return {"tipo": tipo, "http": None, "detalhe": det, "resposta": _trecho(msg),
+            "url": url, "conexao": conexao}
+
+
+class _RegistroErros:
+    """Guarda cada erro de API (thread-safe), grava o CSV de apuração e resume."""
+
+    CAMPOS = ["data_hora", "fonte", "endpoint", "codigo", "pagina", "tipo_erro",
+              "http", "detalhe", "observacao", "resposta_da_api", "mensagem_erro", "url"]
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self.ao_registrar = None        # callback(msg): a interface liga no log
+        self.iniciar("")
+
+    def iniciar(self, pasta):
+        """Zera o registro no início de cada extração. O CSV só é criado se
+        houver erro, na pasta de destino (ou na pasta do programa)."""
+        with self._lock:
+            self.itens = []
+            self._ultimo = {}
+            self.n_429 = 0
+            self.espera_429 = 0.0
+            nome = f"Log_Erros_API_{datetime.now():%Y%m%d_%H%M%S}.csv"
+            self.arquivo = os.path.join(pasta, nome) if pasta else nome
+            self._criado = False
+
+    def contar_429(self, segundos):
+        """429 tratado pela cota não é erro (a chamada é repetida), mas explica
+        lentidão: entra só na apuração final."""
+        with self._lock:
+            self.n_429 += 1
+            self.espera_429 += segundos
+
+    @staticmethod
+    def formatar(it) -> str:
+        onde = " ".join(p for p in (
+            it["endpoint"],
+            f"cód {it['codigo']}" if it["codigo"] != "" else "",
+            f"pág {it['pagina']}" if it["pagina"] != "" else "") if p)
+        txt = f"[{it['fonte']}] {onde}: {it['tipo_erro']} — {it['detalhe']}"
+        if it["observacao"]:
+            txt += f" ({it['observacao']})"
+        if it["resposta_da_api"]:
+            txt += f" | resposta da API: {it['resposta_da_api'][:160]}"
+        elif it["mensagem_erro"]:
+            txt += f" | erro: {it['mensagem_erro'][:160]}"
+        return txt
+
+    def registrar(self, fonte, diag, codigo="", pagina="", obs="") -> str:
+        url = diag.get("url") or ""
+        endpoint = ""
+        if url:
+            endpoint = url.split("?", 1)[0].rstrip("/").rsplit("/", 1)[-1]
+        it = {"data_hora": datetime.now().strftime("%d/%m/%Y %H:%M:%S"),
+              "fonte": fonte, "endpoint": endpoint, "codigo": str(codigo),
+              "pagina": "" if pagina in (None, "") else str(pagina),
+              "tipo_erro": diag["tipo"], "http": diag.get("http") or "",
+              "detalhe": diag["detalhe"], "observacao": obs,
+              # Com HTTP, o texto veio da API; sem HTTP, é a mensagem da exceção
+              "resposta_da_api": (diag.get("resposta") or "") if diag.get("http") else "",
+              "mensagem_erro": "" if diag.get("http") else (diag.get("resposta") or ""),
+              "url": url}
+        msg = self.formatar(it)
+        with self._lock:
+            self.itens.append(it)
+            self._ultimo[(fonte, str(codigo))] = it
+            try:
+                with open(self.arquivo, "a", encoding="utf-8-sig", newline="") as f:
+                    w = csv.DictWriter(f, fieldnames=self.CAMPOS, delimiter=";")
+                    if not self._criado:
+                        w.writeheader()
+                        self._criado = True
+                    w.writerow(it)
+            except Exception:
+                pass                    # sem o CSV, o log da tela ainda mostra o erro
+        cb = self.ao_registrar
+        if cb:
+            try:
+                cb(msg)
+            except Exception:
+                pass
+        return msg
+
+    def resumo(self, codigo, fontes=("DA", "PROGRAMA")) -> str:
+        """Último erro de um código, em poucas palavras (para as mensagens da tela)."""
+        with self._lock:
+            for fonte in fontes:
+                it = self._ultimo.get((fonte, str(codigo)))
+                if it:
+                    return f"{it['fonte']}: {it['tipo_erro']} ({it['detalhe']})"
+        return "detalhes no Log_Erros_API"
+
+    def apurar(self) -> List[str]:
+        """Linhas da apuração final: ocorrências por fonte e tipo de erro."""
+        with self._lock:
+            itens = list(self.itens)
+            n_429, espera = self.n_429, self.espera_429
+        linhas = []
+        if itens:
+            grupos = {}
+            for it in itens:
+                g = grupos.setdefault((it["fonte"], it["tipo_erro"], it["detalhe"]),
+                                      {"n": 0, "codigos": set(), "exemplo": it})
+                g["n"] += 1
+                if it["codigo"]:
+                    g["codigos"].add(it["codigo"])
+            linhas.append(f"🔎 Apuração dos erros de API ({len(itens)} ocorrência(s)):")
+            for (fonte, tipo, det), g in sorted(grupos.items(), key=lambda kv: -kv[1]["n"]):
+                cods = sorted(g["codigos"])
+                ex = g["exemplo"]
+                linhas.append(f"   • [{fonte}] {tipo} — {det}: {g['n']}x em "
+                              f"{len(cods)} código(s)"
+                              + (f" (ex.: {', '.join(cods[:5])}{' …' if len(cods) > 5 else ''})"
+                                 if cods else ""))
+                if ex["resposta_da_api"]:
+                    linhas.append(f"       resposta da API: {ex['resposta_da_api'][:200]}")
+                elif ex["mensagem_erro"]:
+                    linhas.append(f"       erro: {ex['mensagem_erro'][:200]}")
+            linhas.append(f"   Detalhes (URL de cada erro): {os.path.abspath(self.arquivo)}")
+        if n_429:
+            linhas.append(f"⏳ Compras.gov pediu pausa por limite de requisições (HTTP 429) "
+                          f"{n_429}x — {espera:.0f} s de espera no total.")
+        return linhas
+
+
+_erros_api = _RegistroErros()
 
 # =============================================================================
 # TIPOS DE BUSCA  —  espelha o seletor "tipo" do endpoint de Pesquisa de Preço
@@ -687,30 +911,38 @@ def ler_pagina_catmat(codigo, pagina, URL_BASE, TAMANHO_PAGINA, TIMEOUT,
     if data_compra_fim:    base["dataCompraFim"]    = data_compra_fim
 
     def _requisitar(params):
-        """Retorna (csv_text, erro, status_http). csv_text=None quando falhou."""
+        """Retorna (csv_text, diag, status_http). csv_text=None quando falhou;
+        diag = diagnosticar(...) do erro."""
         try:
             resp = _get_compras(URL, params)       # 429 já tratado pela cota
-            if resp.status_code == 429:
-                return None, f"ERRO_REQUISICAO: 429 persistente para {tipo} {codigo}", 429
-            if resp.status_code in (400, 404):
-                return None, f"ERRO_REQUISICAO: HTTP {resp.status_code}", resp.status_code
-            resp.raise_for_status()
+            if resp.status_code >= 400:
+                diag = diagnosticar(resp=resp)
+                if resp.status_code == 429:
+                    diag["detalhe"] += " — persistiu mesmo após as pausas pedidas pela API"
+                return None, diag, resp.status_code
             return resp.content.decode("utf-8-sig", errors="replace"), None, 200
-        except requests.exceptions.ConnectionError as e:
-            return None, f"ERRO_CONEXAO: {e}", None
         except requests.exceptions.RequestException as e:
-            return None, f"ERRO_REQUISICAO: {e}", None
+            return None, diagnosticar(exc=e), None
+
+    def _falha(diag, obs=""):
+        """Registra o erro (fonte DA) e devolve a mensagem ERRO_* do contrato."""
+        _erros_api.registrar("DA", diag, codigo=codigo, pagina=pagina, obs=obs)
+        prefixo = "ERRO_CONEXAO" if diag.get("conexao") else "ERRO_REQUISICAO"
+        return f"{prefixo}: {diag['tipo']} — {diag['detalhe']}"
 
     # ── 1ª opção: assinatura nova (tipo + codigo) ────────────────────────────
     if _API_ACEITA_TIPO is not False:
-        csv_text, erro, status = _requisitar(
+        csv_text, diag, status = _requisitar(
             dict(base, tipo=tipo, codigo=str(int(codigo))))
         if csv_text is not None:
             _API_ACEITA_TIPO = True
             return None, csv_text
         # Só cai para o modo legado quando o servidor recusa a assinatura
         if status not in (400, 404):
-            return None, erro
+            return None, _falha(diag)
+        # Assinatura nova recusada: por PDM não há alternativa
+        if tipo != TIPO_CATMAT:
+            return None, _falha(diag, f"esta instância da API não aceita busca por {tipo}")
         _API_ACEITA_TIPO = False
 
     # ── 2ª opção: assinatura antiga — existe apenas para CATMAT ──────────────
@@ -718,10 +950,10 @@ def ler_pagina_catmat(codigo, pagina, URL_BASE, TAMANHO_PAGINA, TIMEOUT,
         return None, ("ERRO_REQUISICAO: esta instância da API não aceita busca "
                       f"por {tipo}. Selecione CATMAT.")
 
-    csv_text, erro, _ = _requisitar(dict(base, codigoItemCatalogo=int(codigo)))
+    csv_text, diag, _ = _requisitar(dict(base, codigoItemCatalogo=int(codigo)))
     if csv_text is not None:
         return None, csv_text
-    return None, erro
+    return None, _falha(diag, "assinatura antiga (codigoItemCatalogo)")
 
 
 def _normalizar_campo(item: dict, *candidatos, default=""):
@@ -753,22 +985,18 @@ def buscar_pdms_por_classe(codigo_classe: int, URL_BASE: str, TIMEOUT: int,
                 resp.raise_for_status()
                 data    = resp.json()
                 sucesso = True
-            except requests.exceptions.ConnectionError as e:
-                espera = 3 * (tentativa + 1)
-                print(f"Erro conexão classe {codigo_classe} pág {pagina_atual}: {e} "
-                      f"— aguardando {espera}s (tentativa {tentativa+1})")
-                time.sleep(espera)
-                tentativa += 1
             except Exception as e:
-                espera = 2 * (tentativa + 1)
-                print(f"Erro classe {codigo_classe} pág {pagina_atual}: {e} "
-                      f"— aguardando {espera}s (tentativa {tentativa+1})")
+                diag   = diagnosticar(exc=e)
+                espera = (3 if diag["conexao"] else 2) * (tentativa + 1)
+                _erros_api.registrar(
+                    "CATÁLOGO", diag, codigo=f"classe {codigo_classe}", pagina=pagina_atual,
+                    obs=f"tentativa {tentativa+1}/{max_tentativas}"
+                        + (f", nova tentativa em {espera} s"
+                           if tentativa + 1 < max_tentativas else ""))
                 time.sleep(espera)
                 tentativa += 1
 
         if not sucesso or data is None:
-            print(f"Falha definitiva: classe {codigo_classe} pág {pagina_atual} "
-                  f"após {max_tentativas} tentativas")
             return None
 
         if "resultado" in data:
@@ -781,7 +1009,12 @@ def buscar_pdms_por_classe(codigo_classe: int, URL_BASE: str, TIMEOUT: int,
                   f"{total_paginas} página(s)")
         pagina_atual += 1       # o ritmo entre páginas é dado pela cota
 
-    if not all_pdms: return None
+    if not all_pdms:
+        _erros_api.registrar("CATÁLOGO", {
+            "tipo": "Classe sem PDMs", "http": 200,
+            "detalhe": "a API respondeu, mas sem nenhum PDM (classe inexistente ou vazia?)",
+            "resposta": "", "url": ""}, codigo=f"classe {codigo_classe}")
+        return None
 
     # Normalizar campos — a API pode retornar nomes variados
     rows_norm = []
@@ -841,7 +1074,9 @@ def buscar_catmats_por_pdm(codigos_pdm, URL_BASE, TIMEOUT, app,
                 if pagina_atual == 1:
                     total_paginas = data.get("totalPaginas", 1)
                 pagina_atual += 1
-        except Exception:
+        except Exception as e:
+            _erros_api.registrar("CATÁLOGO", diagnosticar(exc=e), codigo=f"PDM {pdm_code}",
+                                 pagina=pagina_atual, obs="lista de CATMATs do PDM")
             with lock:
                 pdms_com_erro.append(pdm_code)
             return
@@ -923,10 +1158,19 @@ def _fetch_catmat_registros(codigo, d_ini, d_fim, salvar_corr, pasta_corr,
                 continue
             break
         if csv_text is None or csv_text.startswith("ERRO_REQUISICAO"):
-            return codigo, [], "erro", 0, {}
+            return codigo, [], "erro", 0, {}   # já registrado em ler_pagina_catmat
 
         reg_esp = _int_do_rodape(csv_text, "totalRegistros") or 0
         if reg_esp == 0:
+            # HTTP 200 que não é CSV (página HTML de erro, JSON do gateway...)
+            # não pode passar como "0 registros": vira erro e é retentado
+            primeira = csv_text.lstrip().split("\n", 1)[0]
+            if "totalRegistros" not in csv_text and ";" not in primeira:
+                _erros_api.registrar("DA", {
+                    "tipo": "Resposta inesperada", "http": 200,
+                    "detalhe": "HTTP 200, mas o conteúdo não é o CSV da Pesquisa de Preço",
+                    "resposta": _trecho(csv_text), "url": ""}, codigo=codigo, pagina=1)
+                return codigo, [], "erro", 0, {}
             return codigo, [], "vazio", 0, {}
 
         # Total de páginas: o rodapé da resposta é a fonte primária. O cálculo
@@ -996,11 +1240,16 @@ def _fetch_catmat_registros(codigo, d_ini, d_fim, salvar_corr, pasta_corr,
                                             TAMANHO_PAGINA, TIMEOUT,
                                             d_ini, d_fim, tipo=tipo)
             if csv_text is None or csv_text.startswith("ERRO_"):
+                # O erro já foi registrado; o relatório de integridade acusa a
+                # divergência deste código
                 break
 
         return codigo, dfs_e_meta, ("ok" if dfs_e_meta else "vazio"), reg_esp, pag_corr
 
-    except Exception:
+    except Exception as e:
+        # Erro no próprio extrator (ex.: mudança de schema), não na API
+        _erros_api.registrar("PROGRAMA", diagnosticar(exc=e), codigo=codigo,
+                             pagina=pagina_atual)
         return codigo, [], "erro", 0, {}
 
 
@@ -1108,9 +1357,9 @@ def _cod_bps(valor) -> str:
     return (s.lstrip("0") or "0") if s.isdigit() else ""
 
 
-def _get_bps(params, cancelado=None, tentativas=4):
+def _get_bps(params, cancelado=None, tentativas=4, contexto=""):
     """Uma página da API do BPS. Devolve (lista, erro); lista=None se falhou."""
-    ultimo = ""
+    ultimo = diag = None
     for t in range(tentativas):
         pausar_extracao.wait()
         if cancelado and cancelado():
@@ -1118,14 +1367,22 @@ def _get_bps(params, cancelado=None, tentativas=4):
         try:
             r = _http.get(URL_BPS, params=params, timeout=TIMEOUT)
             if r.status_code == 429 or r.status_code >= 500:
-                ultimo = f"HTTP {r.status_code}"
+                diag = diagnosticar(resp=r)
                 time.sleep(15 * (t + 1) if r.status_code == 429 else 3 * (t + 1))
                 continue
             r.raise_for_status()
-            return r.json().get("bps") or [], None
+            dados = r.json()
+            if not isinstance(dados, dict):
+                raise ValueError(f"JSON sem o campo 'bps': {_trecho(r.text, 120)}")
+            return dados.get("bps") or [], None
         except (requests.exceptions.RequestException, ValueError) as e:
-            ultimo = f"{type(e).__name__}: {e}"
+            diag = diagnosticar(exc=e)
             time.sleep(3 * (t + 1))
+    if diag is not None:
+        ultimo = f"{diag['tipo']} — {diag['detalhe']}"
+        _erros_api.registrar("BPS", diag, codigo=params.get("codigoCatmat", ""),
+                             pagina=params.get("pagina", ""),
+                             obs=", ".join(p for p in (contexto, f"{tentativas} tentativas") if p))
     return None, ultimo
 
 
@@ -1136,7 +1393,8 @@ def buscar_bps_catmat(codigo, d_ini=None, d_fim=None, cancelado=None):
     if d_fim: base["dataCompraFim"]    = d_fim
     registros = []
     for pagina in range(1, _MAX_PAGINAS + 1):
-        lote, erro = _get_bps(dict(base, pagina=pagina), cancelado)
+        lote, erro = _get_bps(dict(base, pagina=pagina), cancelado,
+                              contexto="registros do período (aba BPS)")
         if lote is None:
             return None, erro
         registros.extend(lote)
@@ -1149,7 +1407,8 @@ def _descricao_bps_sem_periodo(codigo, cancelado=None):
     """Descrição de um CATMAT que não teve compra no BPS dentro do período:
     basta um registro de qualquer data. None = falha; "" = nunca comprado."""
     lote, _ = _get_bps({"codigoCatmat": _cod_bps(codigo), "pagina": 1,
-                        "tamanhoPagina": 1}, cancelado)
+                        "tamanhoPagina": 1}, cancelado,
+                       contexto="descrição do CATMAT")
     if lote is None:
         return None
     return limpar_descricao_bps(lote[0].get("descricaoItem")) if lote else ""
@@ -1160,6 +1419,7 @@ def catmats_do_pdm(pdm, tentativas=3):
     URL = f"{URL_BASE}/modulo-material/4_consultarItemMaterial"
     codigos, pagina, total_paginas = [], 1, 1
     while pagina <= total_paginas:
+        diag = None
         for t in range(tentativas):
             try:
                 # gasta da mesma cota da pesquisa de preço (429 tratado lá)
@@ -1168,9 +1428,12 @@ def catmats_do_pdm(pdm, tentativas=3):
                 resp.raise_for_status()
                 data = resp.json()
                 break
-            except (requests.exceptions.RequestException, ValueError):
+            except (requests.exceptions.RequestException, ValueError) as e:
+                diag = diagnosticar(exc=e)
                 time.sleep(3 * (t + 1))
         else:
+            _erros_api.registrar("CATÁLOGO", diag, codigo=f"PDM {pdm}", pagina=pagina,
+                                 obs=f"lista de CATMATs do PDM para o BPS, {tentativas} tentativas")
             return None
         codigos += [_cod_bps(i.get("codigoItem")) for i in data.get("resultado", [])]
         if pagina == 1:
@@ -1275,6 +1538,8 @@ def _fetch_codigo(codigo, d_ini, d_fim, salvar_corr, pasta_corr,
         try:
             bps = fut.result()
         except Exception as e:              # BPS nunca derruba a extração do Compras.gov
+            _erros_api.registrar("PROGRAMA", diagnosticar(exc=e), codigo=codigo,
+                                 obs="ao montar os dados do BPS")
             bps = {"df": None, "desc": {}, "falhas": [f"{codigo} ({type(e).__name__})"],
                    "trocadas": 0}
     elif cfg["descricao"]:
@@ -1284,8 +1549,9 @@ def _fetch_codigo(codigo, d_ini, d_fim, salvar_corr, pasta_corr,
     if cfg["descricao"] and res[2] == "ok":
         try:
             _aplicar_descricao_bps(res[1], bps, _cancelado_fn)
-        except Exception:
-            pass
+        except Exception as e:
+            _erros_api.registrar("PROGRAMA", diagnosticar(exc=e), codigo=codigo,
+                                 obs="ao trocar a descrição pelo texto do BPS")
     return res + (bps,)
 
 
@@ -1569,6 +1835,11 @@ class App(ctk.CTk):
         # Construir interface ANTES de centralizar
         self._build_header()
         self._build_tabs()
+
+        # Cada erro de API aparece no log com fonte, tipo e resposta da API.
+        # O registro é chamado pelas threads de extração: a tela só é tocada
+        # na thread principal.
+        _erros_api.ao_registrar = lambda m: self._ui(lambda: self._log("🔴 " + m, "err"))
 
         # Centralizar após tudo construído — delay generoso para o Tkinter
         # calcular dimensões reais antes de exibir
@@ -2729,6 +3000,7 @@ class App(ctk.CTk):
         self._pasta_corr  = self.var_pasta.get()
         self._bps_cfg     = self._config_bps()
         self._pasta_classes_destino = pasta_dest
+        _erros_api.iniciar(pasta_dest)
         self.processing   = True
         self.total_baixados = 0
         self.count_corrigidas = 0
@@ -2856,7 +3128,8 @@ class App(ctk.CTk):
                 elif tipo == "erro":
                     with state_lock:
                         catmats_com_erro.append(codigo)
-                    etxt = "⚠️  CATMAT " + str(codigo) + ": erro na API, será retentado."
+                    etxt = ("⚠️  " + ROTULO_TIPO.get(tipo_busca, "Código") + " " + str(codigo)
+                            + ": " + _erros_api.resumo(codigo) + " — será retentado.")
                     self._ui(lambda t=etxt: self._log(t, "warn"))
                 elif tipo == "vazio":
                     vtxt = "ℹ️  " + str(codigo) + ": 0 registros."
@@ -2951,7 +3224,10 @@ class App(ctk.CTk):
             if catmats_com_erro:
                 n_def = len(catmats_com_erro)
                 self._ui(lambda n=n_def, rt=rotulo:
-                    self._log("❌  " + str(n) + " " + rt + "(s) sem resposta após 3 tentativas.", "err"))
+                    self._log("❌  " + str(n) + " " + rt + "(s) sem resposta após 3 tentativas: "
+                              + ", ".join(map(str, catmats_com_erro[:20]))
+                              + (" …" if n > 20 else "")
+                              + " (motivo de cada um na apuração ao final)", "err"))
                 # O Compras.gov falhou de vez, mas o BPS é outro servidor: os
                 # dados dele ainda entram na aba BPS
                 if bps_cfg["aba"] and self.processing:
@@ -2992,7 +3268,9 @@ class App(ctk.CTk):
                     ws.append([tipo_busca, "registros BPS", "status"])
                     for c in codigos_lista:
                         n = reg_bps.get(c, 0)
-                        ws.append([c, n, "ERRO: BPS sem resposta" if c in bps_erro
+                        ws.append([c, n, "ERRO: BPS sem resposta — "
+                                         + _erros_api.resumo(c, ("BPS", "CATÁLOGO", "PROGRAMA"))
+                                   if c in bps_erro
                                    else "OK" if n else "sem registros no BPS"])
                 else:
                     ws.append([tipo_busca,"esperados","baixados","paginas","status"]
@@ -3002,7 +3280,9 @@ class App(ctk.CTk):
                     ex = int(reg_esperados.get(c, 0))
                     pg = pag_corrompidas.get(c, [])
                     d  = abs(ex - bx)
-                    st = ("OK" if d == 0 else
+                    st = ("ERRO_API_PERSISTENTE — " + _erros_api.resumo(c)
+                          if c in catmats_com_erro else
+                          "OK" if d == 0 else
                           "OK (divergencia: " + str(bx) + "/" + str(ex) + ")" if d <= 2 else
                           "Inconsistencia Grave (" + str(bx) + "/" + str(ex) + ")")
                     ws.append([c, ex, bx, ", ".join(map(str, pg)), st]
@@ -3011,7 +3291,8 @@ class App(ctk.CTk):
                     ws.append([])
                     ws.append(["--- " + rotulo + "s sem resposta apos 3 tentativas ---"])
                     for c in catmats_com_erro:
-                        ws.append([c, 0, 0, "", "ERRO_API_PERSISTENTE"])
+                        ws.append([c, 0, 0, "", "ERRO_API_PERSISTENTE — "
+                                   + _erros_api.resumo(c)])
                 wb.save(rel_caminho)
                 self._ui(lambda r=rel_nome:
                     self._log("📊  Relatório: " + r, "info"))
@@ -3120,6 +3401,15 @@ class App(ctk.CTk):
         # ── Todas as classes processadas ──────────────────────────────────────
         self._ui(self._finalizar_fluxo_classes)
 
+    def _log_apuracao_erros(self):
+        """Resumo final: quantos erros, de que tipo, em qual fonte (DA/BPS...)."""
+        linhas = _erros_api.apurar()
+        if not linhas:
+            self._log("✅ Nenhum erro de API nesta extração.", "ok")
+            return
+        for ln in linhas:
+            self._log(ln, "warn")
+
     def _finalizar_fluxo_classes(self):
         """Chamado ao término de todas as classes."""
         foi_cancelado = not self.processing
@@ -3129,6 +3419,7 @@ class App(ctk.CTk):
         self._log(
             "\n🎉 Todas as classes processadas com sucesso!" if not foi_cancelado
             else "\n🛑 Extração cancelada.", "info")
+        self._log_apuracao_erros()
 
         self.btn_start.configure(state="normal")
         self.btn_cancel.configure(state="disabled",
@@ -3183,6 +3474,8 @@ class App(ctk.CTk):
         self.count_corrigidas      = 0
         self.count_reparadas       = 0
         self.count_vazios          = 0
+        self.codigos_com_erro      = set()
+        _erros_api.iniciar(self._pasta_classes_destino.strip())
         pausar_extracao.set()
 
         # Se há arquivo por classe, usamos um writer por classe (criados sob demanda)
@@ -3360,9 +3653,11 @@ class App(ctk.CTk):
                         self._ui(lambda vv=v: self._stat("k_vaz", vv))
 
                 elif tipo in ("erro", "vazio"):
-                    txt = (f"ℹ️  {codigo}: sem registro (erro API)." if tipo == "erro"
-                           else f"ℹ️  {codigo}: 0 registros.")
+                    txt = (f"⚠️  {codigo}: sem registro — {_erros_api.resumo(codigo)}."
+                           if tipo == "erro" else f"ℹ️  {codigo}: 0 registros.")
                     with state_lock:
+                        if tipo == "erro":
+                            self.codigos_com_erro.add(codigo)
                         self.count_vazios += 1
                         v = self.count_vazios
                         self.registros_baixados[codigo]  = 0
@@ -3420,6 +3715,7 @@ class App(ctk.CTk):
         self.set_status("Status: Concluído!" if not foi_cancelado else "Status: Cancelado")
         self._log("\n🎉 Extração concluída!" if not foi_cancelado
                   else "\n🛑 Extração cancelada.", "info")
+        self._log_apuracao_erros()
 
         # Finalizar writers
         parts = []
@@ -3457,7 +3753,9 @@ class App(ctk.CTk):
                 ws.append([tipo_rel, "registros BPS", "status"])
                 for c in self.codigos_lista:
                     n = self.registros_bps.get(c, 0)
-                    ws.append([c, n, "ERRO: BPS sem resposta" if c in self.bps_erro
+                    ws.append([c, n, "ERRO: BPS sem resposta — "
+                                     + _erros_api.resumo(c, ("BPS", "CATÁLOGO", "PROGRAMA"))
+                               if c in self.bps_erro
                                else "OK" if n else "sem registros no BPS"])
             else:
                 ws.append([tipo_rel, "esperados","baixados","paginas","status"]
@@ -3467,7 +3765,9 @@ class App(ctk.CTk):
                 ex = int(self.registros_esperados.get(c,0))
                 pg = self.paginas_corrompidas.get(c,[])
                 d  = abs(ex-bx)
-                st = ("OK" if d==0 else
+                st = (f"ERRO_API — {_erros_api.resumo(c)}"
+                      if c in getattr(self, "codigos_com_erro", ()) else
+                      "OK" if d==0 else
                       f"OK (divergencia: {bx}/{ex})" if d<=2 else
                       f"Inconsistencia Grave ({bx}/{ex})")
                 ws.append([c,ex,bx,", ".join(map(str,pg)),st]
