@@ -15,6 +15,7 @@ Classe  →  PDMs  →  CATMATs  →  Registros de Preços
 ## Índice
 
 - [Instalação e dependências](#instalação-e-dependências)
+- [Extração sem interface](#extração-sem-interface)
 - [As duas abas](#as-duas-abas)
 - [Funcionalidades](#funcionalidades)
 - [Arquitetura](#arquitetura)
@@ -36,6 +37,24 @@ python ExtratorCatmat.py
 O `lxml` é opcional, mas **fortemente recomendado**: o `openpyxl` o usa como acelerador de serialização quando disponível, e a diferença na gravação de planilhas grandes é significativa.
 
 Distribuição em produção: executável gerado com PyInstaller e instalador criado no **Inno Setup**.
+
+---
+
+## Extração sem interface
+
+`extrator_comprasgov.py` é só a parte que conecta no Compras.gov, isolada do `ExtratorCatmat.py`: o mesmo motor (cota de requisições, parser de CSV, paginação, writers em streaming, relatório de integridade), sem CustomTkinter, sem BPS e sem a consolidação DW + DA. Depende apenas de `requests`, `pandas` e `openpyxl`.
+
+```bash
+python extrator_comprasgov.py codigos.xlsx                    # CATMATs do arquivo
+python extrator_comprasgov.py codigos.xlsx -t PDM --por-classe
+python extrator_comprasgov.py -c "451234;451235" -i 01-01-2025 -f 31-12-2025
+python extrator_comprasgov.py --classes "6505;6515" -s saida  # Classe → PDMs → CATMATs → registros
+python extrator_comprasgov.py -h                              # todas as opções
+```
+
+A saída é a mesma da interface (`dados_completos_extraidos_part1.xlsx` ou um `classe_XXXX_part1` por classe, mais o relatório de integridade). Diferenças: códigos com erro de API passam pela fila de retry (15 s → 30 s) também na extração por lista de códigos, e o relatório marca `ERRO_API_PERSISTENTE` e `NAO PROCESSADO (cancelado)` em vez de mostrar esses códigos como `OK`. Ctrl+C cancela e salva o que já foi baixado; um segundo Ctrl+C encerra na hora.
+
+As funções foram copiadas, não importadas: o `ExtratorCatmat.py` continua autossuficiente para o PyInstaller. Uma correção no motor precisa ser feita nos dois arquivos.
 
 ---
 
